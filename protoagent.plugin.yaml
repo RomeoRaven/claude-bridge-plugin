@@ -1,6 +1,6 @@
 id: claude_bridge
 name: Claude Bridge (explore Claude Code state)
-version: 0.3.0
+version: 0.4.0
 description: >-
   Read-only explore tools over Claude Code's on-disk state: per-project session
   transcripts and persistent memory (~/.claude), ephemeral session scratchpads

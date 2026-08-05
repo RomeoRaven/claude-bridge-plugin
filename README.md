@@ -59,9 +59,14 @@ names only.
 - v0.3 — `claude_import_claude_md` (repo operating instructions → knowledge), and
   `claude_import_memory` now imports **all** topics by default (the old `limit=100`
   capped large project memories).
-- Later — console rail view for browsing memory; export a translated bundle as
-  a standalone plugin repo; a `SOUL.md`-addendum mode for CLAUDE.md (always-in-context
-  instead of retrievable).
+- v0.4 — `claude_export_snapshot`: package a translated setup as a **protoAgent agent
+  snapshot** (ADR 0091) that `protoagent agent import` consumes directly. One artifact
+  schema, not two — the bundle inherits that format's plan/consent gate, its
+  `required_secrets` inventory and its REVIEW.md. MCP credential values are nulled and
+  listed; memory is an opt-in seed that marks the bundle non-publishable; `CLAUDE.md` rides
+  knowledge, not SOUL (it is instructions, not a persona).
+- Later — console rail view for browsing memory; a `SOUL.md`-addendum mode for CLAUDE.md
+  (always-in-context instead of retrievable).
 
 ## Install
 

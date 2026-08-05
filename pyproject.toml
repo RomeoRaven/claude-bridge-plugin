@@ -1,6 +1,6 @@
 [project]
 name = "claude-bridge"
-version = "0.3.0"
+version = "0.4.0"
 description = "protoAgent plugin: read-only explore tools over Claude Code's on-disk state (CLI store, scratchpads, Cowork sessions), with artifact translators to follow."
 requires-python = ">=3.11"
 
