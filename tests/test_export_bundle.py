@@ -10,7 +10,9 @@ one in `settings.json`, and the litmus greps the built zip's bytes for it.
 from __future__ import annotations
 
 import io
+import secrets
 import zipfile
+from pathlib import Path
 
 import claude_bridge  # noqa: F401 — registers the synthetic package (conftest)
 import pytest
@@ -19,7 +21,7 @@ from claude_bridge.export_bundle import SNAPSHOT_VERSION, build_bundle, manifest
 from claude_bridge.tools_export import build_export_tools
 from claude_bridge.translate import TranslatedSkill, TranslatedSubagent
 
-from tests.conftest import SECRET
+from tests.conftest import PROJECT_DIR, SECRET
 
 
 def _skill(name="demo-skill"):
@@ -99,6 +101,7 @@ class TestSecretsStayBehind:
                 "name": "github",
                 "transport": "stdio",
                 "command": "gh-mcp",
+                "args": ["serve", "--token", SECRET],
                 "env": {"GH_TOKEN": SECRET, "GH_HOST": "github.com"},
             },
             {
@@ -115,22 +118,52 @@ class TestSecretsStayBehind:
         data, _ = build_bundle(agent_name="x", skills=[], subagents=[], mcp_servers=self._servers())
         assert SECRET.encode() not in data
 
+    def test_decompressed_snapshot_strips_every_mcp_value_and_url_credential_component(self):
+        marker = secrets.token_urlsafe(24)
+        servers = [
+            {
+                "name": "private-endpoint",
+                "transport": "http",
+                "url": f"https://person:{marker}@example.test/mcp?opaque={marker}#fragment-{marker}",
+                "env": {"MODE": marker},
+                "headers": {"X-Custom": marker},
+            }
+        ]
+
+        data, _ = build_bundle(agent_name="x", skills=[], subagents=[], mcp_servers=servers)
+        manifest = manifest_of(data)
+        rendered = yaml.safe_dump(manifest)
+        exported = manifest["config"]["mcp"]["servers"][0]
+
+        assert marker not in rendered
+        assert exported["url"] == "https://example.test/mcp"
+        assert exported["env"] == {"MODE": ""}
+        assert exported["headers"] == {"X-Custom": ""}
+
     def test_the_keys_survive_so_the_importer_knows_what_to_set(self):
         m = manifest_of(build_bundle(agent_name="x", skills=[], subagents=[], mcp_servers=self._servers())[0])
         github = next(s for s in m["config"]["mcp"]["servers"] if s["name"] == "github")
-        assert github["env"] == {"GH_TOKEN": "", "GH_HOST": "github.com"}
+        assert github["env"] == {"GH_TOKEN": "", "GH_HOST": ""}
         assert github["command"] == "gh-mcp"
 
-    def test_non_secret_env_values_are_kept(self):
-        """Over-nulling would silently break a server whose config was never sensitive."""
+    def test_stdio_arguments_stay_behind_and_are_inventoried(self):
         m = manifest_of(build_bundle(agent_name="x", skills=[], subagents=[], mcp_servers=self._servers())[0])
         github = next(s for s in m["config"]["mcp"]["servers"] if s["name"] == "github")
-        assert github["env"]["GH_HOST"] == "github.com"
+        names = {row["name"] for row in m["required_secrets"]}
+
+        assert github["args"] == []
+        assert "mcp.github.args" in names
+
+    def test_every_env_value_stays_behind_while_its_key_survives(self):
+        m = manifest_of(build_bundle(agent_name="x", skills=[], subagents=[], mcp_servers=self._servers())[0])
+        github = next(s for s in m["config"]["mcp"]["servers"] if s["name"] == "github")
+        assert github["env"]["GH_HOST"] == ""
 
     def test_every_nulled_key_is_inventoried(self):
         _, plan = build_bundle(agent_name="x", skills=[], subagents=[], mcp_servers=self._servers())
         names = {r["name"] for r in plan.required_secrets}
         assert "mcp.github.env.GH_TOKEN" in names
+        assert "mcp.github.env.GH_HOST" in names
         assert "mcp.vendor.headers.Authorization" in names
         assert all(r["was_set"] for r in plan.required_secrets)
 
@@ -209,6 +242,39 @@ class TestExportTool:
         written = next(out.glob("*.zip"))
         assert SECRET.encode() not in written.read_bytes()
         assert manifest_of(written.read_bytes())["kind"] == "agent-snapshot"
+
+    def test_include_memory_uses_canonical_claude_project_store(self, fake_home, tmp_path):
+        out = tmp_path / "bundles"
+
+        result = self._tool(fake_home).invoke(
+            {
+                "project_dir": PROJECT_DIR,
+                "include_memory": True,
+                "out": str(out),
+                "apply": True,
+            }
+        )
+        written = next(out.glob("*.zip"))
+        with zipfile.ZipFile(written) as archive:
+            memory = archive.read("knowledge/claude-import.md").decode()
+
+        assert "The fact body." in memory
+        assert "NOT publishable" in result
+
+    def test_export_honors_configured_read_cap(self, fake_home, tmp_path):
+        marker = secrets.token_urlsafe(24)
+        skill_md = Path(fake_home["cli_root"]) / "skills" / "demo-skill" / "SKILL.md"
+        skill_md.write_text("---\nname: demo-skill\ndescription: Demo.\n---\n\n" + marker + "\n")
+        capped = dict(fake_home, max_read_bytes=16)
+        out = tmp_path / "bundles"
+
+        result = build_export_tools(capped)[0].invoke({"out": str(out), "apply": True})
+        written = next(out.glob("*.zip"))
+        with zipfile.ZipFile(written) as archive:
+            decompressed = b"".join(archive.read(name) for name in archive.namelist())
+
+        assert marker.encode() not in decompressed
+        assert "max_read_bytes" in result
 
     def test_the_reply_tells_the_operator_to_read_the_review(self, fake_home, tmp_path):
         res = self._tool(fake_home).invoke({"out": str(tmp_path), "apply": True})

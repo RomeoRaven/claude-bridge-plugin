@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import secrets
+
 from claude_bridge import translate as tr
 
 
@@ -48,6 +50,33 @@ def test_translate_skill_refuses_anthropic_material(tmp_path):
         "---\nname: lic\ndescription: X.\nlicense: Anthropic terms of service\n---\n\nBody.\n"
     )
     assert tr.translate_skill_dir(lic) is None
+
+
+def test_translate_skill_refuses_symlinked_root_escape(tmp_path):
+    marker = secrets.token_urlsafe(24)
+    outside = tmp_path / "outside-skill"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text(f"---\nname: outside\ndescription: {marker}\n---\n\n{marker}\n")
+    linked = tmp_path / "linked-skill"
+    linked.symlink_to(outside, target_is_directory=True)
+
+    assert tr.translate_skill_dir(linked) is None
+
+
+def test_translate_skill_refuses_symlinked_supporting_file_escape(tmp_path):
+    marker = secrets.token_urlsafe(24)
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: safe-skill\ndescription: Safe.\n---\n\nBody.\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text(marker)
+    (skill / "linked.txt").symlink_to(outside)
+
+    translated = tr.translate_skill_dir(skill)
+
+    assert translated is not None
+    assert marker.encode() not in translated.files.values()
+    assert "linked.txt" not in translated.files
 
 
 def test_translate_command_becomes_slash_skill(tmp_path):

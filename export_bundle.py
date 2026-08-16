@@ -55,6 +55,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 SNAPSHOT_MANIFEST = "agent.snapshot.yaml"
 #: The ADR 0091 schema version this emits. Bumping protoAgent's version without bumping
@@ -62,14 +63,22 @@ SNAPSHOT_MANIFEST = "agent.snapshot.yaml"
 #: a mismatch is loud rather than subtly wrong.
 SNAPSHOT_VERSION = 1
 
-#: Substrings that mark an MCP env var as credential-bearing. Matched loosely on purpose:
-#: over-nulling costs the importer one prompt, under-nulling ships a live token.
-_SECRETISH = ("key", "token", "secret", "password", "passwd", "credential", "auth", "bearer")
 
-
-def _is_secretish(name: str) -> bool:
-    lowered = str(name).lower()
-    return any(s in lowered for s in _SECRETISH)
+def _credential_free_url(value: object) -> str:
+    """Keep an endpoint's location while removing credential-bearing URL parts."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = parsed.port
+        netloc = host + (f":{port}" if port is not None else "")
+        if not parsed.scheme or not netloc:
+            return ""
+        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    except ValueError:
+        return ""
 
 
 @dataclass
@@ -136,13 +145,35 @@ def _null_mcp_secrets(servers: list[dict]) -> tuple[list[dict], list[dict]]:
         if not isinstance(entry, dict):
             continue
         name = str(entry.get("name") or "?")
+        args = entry.get("args")
+        if isinstance(args, list) and args:
+            had = any(str(value or "").strip() for value in args)
+            entry["args"] = []
+            required.append(
+                {
+                    "name": f"mcp.{name}.args",
+                    "kind": "mcp_args",
+                    "description": f"Command arguments for MCP server `{name}` (removed on export).",
+                    "was_set": had,
+                }
+            )
+        if entry.get("url"):
+            original_url = str(entry["url"])
+            entry["url"] = _credential_free_url(original_url)
+            if entry["url"] != original_url:
+                required.append(
+                    {
+                        "name": f"mcp.{name}.url",
+                        "kind": "mcp_url",
+                        "description": f"Credential-bearing URL parts for MCP server `{name}` (removed on export).",
+                        "was_set": True,
+                    }
+                )
         for field_name in ("env", "headers"):
             values = entry.get(field_name)
             if not isinstance(values, dict):
                 continue
             for var in list(values):
-                if not _is_secretish(var):
-                    continue
                 had = bool(str(values.get(var) or "").strip())
                 values[var] = ""
                 required.append(

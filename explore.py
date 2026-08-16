@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from langchain_core.tools import tool
 
-from .stores import ClaudeStores, project_slug_candidates
+from .stores import ClaudeStores, FencedRoot, project_slug_candidates
 
 _LIST_CAP = 40
 _SNIPPET = 200
@@ -65,6 +66,22 @@ def _frontmatter(text: str) -> dict:
         return {}
 
 
+def _credential_free_url(value: object) -> str:
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = parsed.port
+        netloc = host + (f":{port}" if port is not None else "")
+        if not parsed.scheme or not netloc:
+            return "[redacted]"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    except ValueError:
+        return "[redacted]"
+
+
 def _redact_mcp(servers) -> list[str]:
     """Describe MCP server entries without echoing env values, headers, or URLs' secrets."""
     out = []
@@ -78,7 +95,7 @@ def _redact_mcp(servers) -> list[str]:
         if entry.get("command"):
             bits.append(f"command={entry['command']} args={len(entry.get('args') or [])}")
         if entry.get("url"):
-            bits.append(f"url={str(entry['url']).split('?')[0]}")
+            bits.append(f"url={_credential_free_url(entry['url'])}")
         env_keys = sorted((entry.get("env") or {}).keys())
         if env_keys:
             bits.append(f"env keys={env_keys}")
@@ -351,42 +368,61 @@ def build_explore_tools(cfg: dict) -> list:
             cli = stores.cli.root
             sections: list[str] = []
 
-            def _md_listing(folder: Path, kind: str) -> None:
+            def _bounded_text(fence: FencedRoot, rel: str, label: str) -> str | None:
+                try:
+                    text, truncated = fence.read_text(rel, stores.max_read_bytes)
+                except (OSError, ValueError):
+                    sections.append(f"{label}: (unreadable or outside declared root)")
+                    return None
+                if truncated:
+                    sections.append(f"{label}: (truncated at max_read_bytes={stores.max_read_bytes})")
+                    return None
+                return text
+
+            def _md_listing(folder: Path, kind: str, fence: FencedRoot) -> None:
                 if not folder.is_dir():
                     return
                 rows = []
                 for p in sorted(folder.iterdir()):
-                    text = ""
+                    rel = ""
                     if p.is_dir() and (p / "SKILL.md").is_file():
-                        text = (p / "SKILL.md").read_text(encoding="utf-8", errors="replace")
+                        rel = str((p / "SKILL.md").relative_to(fence.root))
                     elif p.suffix == ".md":
-                        text = p.read_text(encoding="utf-8", errors="replace")
+                        rel = str(p.relative_to(fence.root))
                     else:
+                        continue
+                    try:
+                        text, truncated = fence.read_text(rel, stores.max_read_bytes)
+                    except (OSError, ValueError):
                         continue
                     fm = _frontmatter(text)
                     name = fm.get("name") or p.stem
-                    rows.append(f"- {name}: {_snippet(str(fm.get('description', '')), 110)}")
+                    description = _snippet(str(fm.get("description", "")), 110)
+                    rows.append(f"- {name}: {description}" + (" [truncated]" if truncated else ""))
                 if rows:
                     sections.append(f"{kind} ({len(rows)}):\n" + _capped(rows))
 
-            _md_listing(cli / "skills", "user skills")
-            _md_listing(cli / "agents", "user subagents")
-            _md_listing(cli / "commands", "user commands")
+            _md_listing(cli / "skills", "user skills", stores.cli)
+            _md_listing(cli / "agents", "user subagents", stores.cli)
+            _md_listing(cli / "commands", "user commands", stores.cli)
 
             installed = cli / "plugins" / "installed_plugins.json"
             if installed.is_file():
                 try:
-                    data = json.loads(installed.read_text(encoding="utf-8"))
+                    raw = _bounded_text(stores.cli, "plugins/installed_plugins.json", "installed plugins")
+                    data = json.loads(raw) if raw is not None else {}
                     plugins = data.get("plugins")
                     names = sorted(plugins.keys()) if isinstance(plugins, dict) else []
-                    sections.append(f"installed plugins ({len(names)}): " + ", ".join(names))
+                    if raw is not None:
+                        sections.append(f"installed plugins ({len(names)}): " + ", ".join(names))
                 except ValueError:
                     sections.append("installed plugins: (unreadable)")
 
             settings = cli / "settings.json"
             if settings.is_file():
                 try:
-                    data = json.loads(settings.read_text(encoding="utf-8"))
+                    raw = _bounded_text(stores.cli, "settings.json", "settings")
+                    data = json.loads(raw) if raw is not None else {}
                     bits = []
                     if data.get("model"):
                         bits.append(f"model={data['model']}")
@@ -394,39 +430,47 @@ def build_explore_tools(cfg: dict) -> list:
                         bits.append(f"enabledPlugins={len(data['enabledPlugins'])}")
                     if isinstance(data.get("hooks"), dict):
                         bits.append(f"hooks={sorted(data['hooks'].keys())}")
-                    sections.append("settings: " + (", ".join(bits) if bits else "(no highlights)"))
-                    if isinstance(data.get("mcpServers"), dict) and data["mcpServers"]:
+                    if raw is not None:
+                        sections.append("settings: " + (", ".join(bits) if bits else "(no highlights)"))
+                    if raw is not None and isinstance(data.get("mcpServers"), dict) and data["mcpServers"]:
                         sections.append("user MCP servers:\n" + "\n".join(_redact_mcp(data["mcpServers"])))
                 except ValueError:
                     sections.append("settings: (unreadable)")
 
             if project_dir:
                 proj = Path(project_dir).expanduser()
+                project_fence = FencedRoot("project", proj)
                 sections.append(f"— project level: {proj} —")
                 dot = proj / ".claude"
-                _md_listing(dot / "skills", "project skills")
-                _md_listing(dot / "agents", "project subagents")
-                _md_listing(dot / "commands", "project commands")
+                _md_listing(dot / "skills", "project skills", project_fence)
+                _md_listing(dot / "agents", "project subagents", project_fence)
+                _md_listing(dot / "commands", "project commands", project_fence)
                 psettings = dot / "settings.json"
                 if psettings.is_file():
                     try:
-                        data = json.loads(psettings.read_text(encoding="utf-8"))
+                        raw = _bounded_text(project_fence, ".claude/settings.json", "project settings")
+                        data = json.loads(raw) if raw is not None else {}
                         hooks = data.get("hooks")
-                        if isinstance(hooks, dict):
+                        if raw is not None and isinstance(hooks, dict):
                             sections.append(f"project hooks: {sorted(hooks.keys())}")
                     except ValueError:
                         sections.append("project settings: (unreadable)")
                 mcp = proj / ".mcp.json"
                 if mcp.is_file():
                     try:
-                        data = json.loads(mcp.read_text(encoding="utf-8"))
-                        sections.append("project MCP servers:\n" + "\n".join(_redact_mcp(data.get("mcpServers") or {})))
+                        raw = _bounded_text(project_fence, ".mcp.json", "project .mcp.json")
+                        data = json.loads(raw) if raw is not None else {}
+                        if raw is not None:
+                            sections.append(
+                                "project MCP servers:\n" + "\n".join(_redact_mcp(data.get("mcpServers") or {}))
+                            )
                     except ValueError:
                         sections.append("project .mcp.json: (unreadable)")
                 if (proj / "CLAUDE.md").is_file():
-                    first = (proj / "CLAUDE.md").read_text(encoding="utf-8", errors="replace").splitlines()
-                    heading = next((ln for ln in first if ln.strip()), "")
-                    sections.append(f"CLAUDE.md: present ({_snippet(heading, 80)})")
+                    raw = _bounded_text(project_fence, "CLAUDE.md", "CLAUDE.md")
+                    if raw is not None:
+                        heading = next((ln for ln in raw.splitlines() if ln.strip()), "")
+                        sections.append(f"CLAUDE.md: present ({_snippet(heading, 80)})")
 
             return "\n\n".join(sections) if sections else "nothing found"
         except Exception as exc:  # noqa: BLE001

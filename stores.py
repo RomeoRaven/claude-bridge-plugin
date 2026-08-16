@@ -66,10 +66,16 @@ class FencedRoot:
 
     def read_text(self, rel: str, max_bytes: int) -> tuple[str, bool]:
         """Read a fenced file, capped at max_bytes. Returns (text, truncated)."""
+        data, truncated = self.read_bytes(rel, max_bytes)
+        return data.decode("utf-8", errors="replace"), truncated
+
+    def read_bytes(self, rel: str, max_bytes: int) -> tuple[bytes, bool]:
+        """Read at most max_bytes plus one sentinel byte from a fenced file."""
         target = self.resolve(rel)
-        data = target.read_bytes()
+        with target.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
         truncated = len(data) > max_bytes
-        return data[:max_bytes].decode("utf-8", errors="replace"), truncated
+        return data[:max_bytes], truncated
 
 
 class ClaudeStores:
@@ -87,10 +93,12 @@ class ClaudeStores:
         )
 
     def find_project(self, directory: str) -> tuple[str, Path] | None:
-        """Map a directory to its ~/.claude/projects entry, if one exists."""
-        projects = self.cli.root / "projects"
+        """Map a directory to its fenced ~/.claude/projects entry, if one exists."""
         for slug in project_slug_candidates(directory):
-            candidate = projects / slug
+            try:
+                candidate = self.cli.resolve(f"projects/{slug}")
+            except (OSError, ValueError):
+                continue
             if candidate.is_dir():
                 return slug, candidate
         return None

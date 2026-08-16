@@ -14,21 +14,53 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-from .stores import ClaudeStores
+from .explore import _credential_free_url
+from .stores import ClaudeStores, FencedRoot
 from . import translate as tr
 from . import importer
 
 
-def _cowork_manifest_types(cowork_root: Path) -> dict[str, str]:
-    """skill name → creatorType from every Cowork skills-plugin manifest."""
-    out: dict[str, str] = {}
-    for manifest in cowork_root.glob("skills-plugin/*/*/manifest.json"):
+def _bounded_text(fence: FencedRoot, rel: str, max_bytes: int) -> str:
+    text, truncated = fence.read_text(rel, max_bytes)
+    if truncated:
+        raise ValueError(f"{rel} exceeds max_read_bytes={max_bytes}")
+    return text
+
+
+def _bounded_json(fence: FencedRoot, rel: str, max_bytes: int) -> dict:
+    data = json.loads(_bounded_text(fence, rel, max_bytes))
+    return data if isinstance(data, dict) else {}
+
+
+def _safe_markdown_files(fence: FencedRoot, rel_dir: str) -> list[Path]:
+    try:
+        root = fence.resolve(rel_dir)
+    except (OSError, ValueError):
+        return []
+    if not root.is_dir():
+        return []
+    safe: list[Path] = []
+    for path in sorted(root.glob("*.md")):
         try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
+            candidate = fence.resolve(str(path.relative_to(fence.root)))
+        except (OSError, ValueError):
+            continue
+        if candidate.is_file():
+            safe.append(candidate)
+    return safe
+
+
+def _cowork_manifest_types(stores: ClaudeStores) -> dict[str, str]:
+    """skill name → creatorType from every fenced Cowork manifest."""
+    out: dict[str, str] = {}
+    for manifest in stores.cowork.root.glob("skills-plugin/*/*/manifest.json"):
+        try:
+            rel = str(manifest.relative_to(stores.cowork.root))
+            data = _bounded_json(stores.cowork, rel, stores.max_read_bytes)
         except (ValueError, OSError):
             continue
         for s in data.get("skills") or []:
-            if s.get("name"):
+            if isinstance(s, dict) and s.get("name"):
                 out[s["name"]] = str(s.get("creatorType") or "")
     return out
 
@@ -39,27 +71,45 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
     Exclusions are license-driven and non-negotiable: Cowork's manifest marks
     Anthropic-authored skills (`creatorType: anthropic`) — those never enter
     the candidate list, only the excluded report."""
+
+    def _safe_dirs(fence: FencedRoot, paths) -> list[Path]:
+        safe: list[Path] = []
+        for path in paths:
+            try:
+                candidate = fence.resolve(str(path.relative_to(fence.root)))
+            except (OSError, ValueError):
+                continue
+            if candidate.is_dir():
+                safe.append(candidate)
+        return safe
+
     if source == "user":
-        root = stores.cli.root / "skills"
+        try:
+            root = stores.cli.resolve("skills")
+        except (OSError, ValueError):
+            return [], []
         if not root.is_dir():
             return [], []
-        return [(p, "claude-code:user") for p in sorted(root.iterdir()) if p.is_dir()], []
+        return [(p, "claude-code:user") for p in _safe_dirs(stores.cli, sorted(root.iterdir()))], []
     if source == "cowork":
-        types = _cowork_manifest_types(stores.cowork.root)
+        types = _cowork_manifest_types(stores)
         candidates, excluded = [], []
-        for p in sorted(stores.cowork.root.glob("skills-plugin/*/*/skills/*")):
-            if not p.is_dir():
-                continue
+        paths = _safe_dirs(stores.cowork, sorted(stores.cowork.root.glob("skills-plugin/*/*/skills/*")))
+        for p in paths:
             if types.get(p.name, "").lower() == "anthropic":
                 excluded.append(p.name)
             else:
                 candidates.append((p, "claude-cowork"))
         return candidates, excluded
     # anything else is a project directory
-    root = Path(source).expanduser() / ".claude" / "skills"
+    project = FencedRoot("project", Path(source).expanduser())
+    try:
+        root = project.resolve(".claude/skills")
+    except (OSError, ValueError):
+        return [], []
     if not root.is_dir():
         return [], []
-    return [(p, f"claude-code:{source}") for p in sorted(root.iterdir()) if p.is_dir()], []
+    return [(p, f"claude-code:{source}") for p in _safe_dirs(project, sorted(root.iterdir()))], []
 
 
 def _pick(names: str, available: list[str]) -> list[str]:
@@ -86,53 +136,60 @@ def build_import_tools(cfg: dict) -> list:
                 candidates, excluded = _skill_sources(stores, source)
                 names = []
                 for d, _ in candidates:
+                    skill_fence = FencedRoot("skill", d)
                     meta, _body = tr.parse_frontmatter(
-                        (d / "SKILL.md").read_text(encoding="utf-8", errors="replace")
+                        _bounded_text(skill_fence, "SKILL.md", stores.max_read_bytes)
                         if (d / "SKILL.md").is_file()
                         else ""
                     )
-                    (excluded if tr.is_anthropic_material(d, meta) else names).append(d.name)
+                    (excluded if tr.is_anthropic_material(d, meta, stores.max_read_bytes) else names).append(d.name)
                 if names or excluded:
                     lines.append(f"skills [{source}]: {', '.join(names) or '(none)'}")
                     if excluded:
                         lines.append(f"  excluded (Anthropic-licensed, never imported): {', '.join(excluded)}")
-            cmd_root = stores.cli.root / "commands"
-            cmds = [p.stem for p in sorted(cmd_root.glob("*.md"))] if cmd_root.is_dir() else []
-            if project_dir:
-                proj_cmds = Path(project_dir).expanduser() / ".claude" / "commands"
-                cmds += [p.stem for p in sorted(proj_cmds.glob("*.md"))] if proj_cmds.is_dir() else []
+            cmds = [p.stem for p in _safe_markdown_files(stores.cli, "commands")]
+            project_fence = FencedRoot("project", Path(project_dir).expanduser()) if project_dir else None
+            if project_fence is not None:
+                cmds += [p.stem for p in _safe_markdown_files(project_fence, ".claude/commands")]
             if cmds:
                 lines.append(f"commands: {', '.join(cmds)}")
-            agents_root = stores.cli.root / "agents"
-            agents = [p.stem for p in sorted(agents_root.glob("*.md"))] if agents_root.is_dir() else []
-            if project_dir:
-                proj_agents = Path(project_dir).expanduser() / ".claude" / "agents"
-                agents += [p.stem for p in sorted(proj_agents.glob("*.md"))] if proj_agents.is_dir() else []
+            agents = [p.stem for p in _safe_markdown_files(stores.cli, "agents")]
+            if project_fence is not None:
+                agents += [p.stem for p in _safe_markdown_files(project_fence, ".claude/agents")]
             if agents:
                 lines.append(f"subagents: {', '.join(agents)}")
             mcp_names: list[str] = []
             settings = stores.cli.root / "settings.json"
             if settings.is_file():
                 try:
-                    mcp_names += sorted((json.loads(settings.read_text()).get("mcpServers") or {}).keys())
-                except ValueError:
-                    pass
-            if project_dir and (Path(project_dir).expanduser() / ".mcp.json").is_file():
-                try:
                     mcp_names += sorted(
                         (
-                            json.loads((Path(project_dir).expanduser() / ".mcp.json").read_text()).get("mcpServers")
-                            or {}
+                            _bounded_json(stores.cli, "settings.json", stores.max_read_bytes).get("mcpServers") or {}
                         ).keys()
                     )
                 except ValueError:
                     pass
+            if project_dir:
+                project_fence = FencedRoot("project", Path(project_dir).expanduser())
+                if (Path(project_dir).expanduser() / ".mcp.json").is_file():
+                    try:
+                        mcp_names += sorted(
+                            (
+                                _bounded_json(project_fence, ".mcp.json", stores.max_read_bytes).get("mcpServers") or {}
+                            ).keys()
+                        )
+                    except ValueError:
+                        pass
             if mcp_names:
                 lines.append(f"mcp servers: {', '.join(mcp_names)}")
             if project_dir:
                 found = stores.find_project(project_dir)
                 if found:
-                    n = len(tr.memory_chunks(found[1] / "memory")) if (found[1] / "memory").is_dir() else 0
+                    n = (
+                        len(tr.memory_chunks(found[1] / "memory", stores.max_read_bytes))
+                        if (found[1] / "memory").is_dir()
+                        else 0
+                    )
                     lines.append(f"memory: {n} topic files for {project_dir}")
             return "\n".join(lines) if lines else "nothing importable found"
         except Exception as exc:  # noqa: BLE001
@@ -155,7 +212,7 @@ def build_import_tools(cfg: dict) -> list:
             for d, label in candidates:
                 if d.name not in chosen:
                     continue
-                translated = tr.translate_skill_dir(d, source=label)
+                translated = tr.translate_skill_dir(d, source=label, max_bytes=stores.max_read_bytes)
                 if translated is None:
                     results.append(f"- {d.name}: REFUSED (Anthropic-licensed or unreadable)")
                     continue
@@ -181,17 +238,17 @@ def build_import_tools(cfg: dict) -> list:
         'all'. Dry-run by default; existing skills are never overwritten.
         """
         try:
-            roots = [stores.cli.root / "commands"]
+            files = _safe_markdown_files(stores.cli, "commands")
             if project_dir:
-                roots.append(Path(project_dir).expanduser() / ".claude" / "commands")
-            files = [p for r in roots if r.is_dir() for p in sorted(r.glob("*.md"))]
+                project_fence = FencedRoot("project", Path(project_dir).expanduser())
+                files += _safe_markdown_files(project_fence, ".claude/commands")
             chosen = _pick(names, [p.stem for p in files])
             results: list[str] = []
             target = importer.skills_target_root() if apply else None
             for p in files:
                 if p.stem not in chosen:
                     continue
-                translated = tr.translate_command_md(p)
+                translated = tr.translate_command_md(p, max_bytes=stores.max_read_bytes)
                 for w in translated.warnings:
                     results.append(f"  note ({translated.name}): {w}")
                 if apply and target is not None:
@@ -214,17 +271,17 @@ def build_import_tools(cfg: dict) -> list:
         model). Dry-run by default.
         """
         try:
-            roots = [stores.cli.root / "agents"]
+            files = _safe_markdown_files(stores.cli, "agents")
             if project_dir:
-                roots.append(Path(project_dir).expanduser() / ".claude" / "agents")
-            files = [p for r in roots if r.is_dir() for p in sorted(r.glob("*.md"))]
+                project_fence = FencedRoot("project", Path(project_dir).expanduser())
+                files += _safe_markdown_files(project_fence, ".claude/agents")
             chosen = _pick(names, [p.stem for p in files])
             subs = []
             results: list[str] = []
             for p in files:
                 if p.stem not in chosen:
                     continue
-                s = tr.translate_subagent_md(p)
+                s = tr.translate_subagent_md(p, max_bytes=stores.max_read_bytes)
                 subs.append(s)
                 results.append(f"- {s.name}: tools={s.tools or '(text-only)'}")
                 results += [f"  note: {w}" for w in s.warnings]
@@ -252,14 +309,17 @@ def build_import_tools(cfg: dict) -> list:
             settings = stores.cli.root / "settings.json"
             if settings.is_file():
                 try:
-                    cc.update(json.loads(settings.read_text()).get("mcpServers") or {})
+                    cc.update(_bounded_json(stores.cli, "settings.json", stores.max_read_bytes).get("mcpServers") or {})
                 except ValueError:
                     pass
             if project_dir:
+                project_fence = FencedRoot("project", Path(project_dir).expanduser())
                 mcp_json = Path(project_dir).expanduser() / ".mcp.json"
                 if mcp_json.is_file():
                     try:
-                        cc.update(json.loads(mcp_json.read_text()).get("mcpServers") or {})
+                        cc.update(
+                            _bounded_json(project_fence, ".mcp.json", stores.max_read_bytes).get("mcpServers") or {}
+                        )
                     except ValueError:
                         pass
             chosen = _pick(names, sorted(cc.keys()))
@@ -268,8 +328,12 @@ def build_import_tools(cfg: dict) -> list:
                 return "no matching MCP servers found"
             results = []
             for e in entries:
-                safe = {k: v for k, v in e.items() if k not in ("env", "headers")}
+                safe = {k: v for k, v in e.items() if k not in ("env", "headers", "args")}
+                if safe.get("url"):
+                    safe["url"] = _credential_free_url(safe["url"])
                 extras = []
+                if e.get("args"):
+                    extras.append(f"args={len(e['args'])}")
                 if e.get("env"):
                     extras.append(f"env keys={sorted(e['env'])}")
                 if e.get("headers"):
@@ -297,7 +361,7 @@ def build_import_tools(cfg: dict) -> list:
             found = stores.find_project(directory)
             if not found or not (found[1] / "memory").is_dir():
                 return f"no Claude Code memory for {directory!r}"
-            chunks = tr.memory_chunks(found[1] / "memory")
+            chunks = tr.memory_chunks(found[1] / "memory", stores.max_read_bytes)
             if int(limit) > 0:
                 chunks = chunks[: int(limit)]
             if not chunks:
@@ -328,13 +392,15 @@ def build_import_tools(cfg: dict) -> list:
         in context, promote the translated text into the agent's SOUL.md yourself.
         """
         try:
-            claude_md = Path(directory).expanduser() / "CLAUDE.md"
+            project = Path(directory).expanduser()
+            claude_md = project / "CLAUDE.md"
             if not claude_md.is_file():
                 return f"no CLAUDE.md in {directory!r}"
-            content = claude_md.read_text(encoding="utf-8", errors="replace").strip()
+            project_fence = FencedRoot("project", project)
+            content = _bounded_text(project_fence, "CLAUDE.md", stores.max_read_bytes).strip()
             if not content:
                 return "CLAUDE.md is empty"
-            heading = f"Operating instructions (CLAUDE.md) — {Path(directory).expanduser().name}"
+            heading = f"Operating instructions (CLAUDE.md) — {project.name}"
             if not apply:
                 return (
                     f"DRY RUN — CLAUDE.md ({len(content)} chars) would be ingested into knowledge "
@@ -360,14 +426,20 @@ def build_import_tools(cfg: dict) -> list:
         """
         try:
             sections: list[str] = []
-            for label, path in [
-                ("user", stores.cli.root / "settings.json"),
-                ("project", Path(project_dir).expanduser() / ".claude" / "settings.json" if project_dir else None),
-            ]:
-                if path is None or not path.is_file():
+            sources: list[tuple[str, FencedRoot, str]] = [("user", stores.cli, "settings.json")]
+            if project_dir:
+                sources.append(
+                    (
+                        "project",
+                        FencedRoot("project", Path(project_dir).expanduser()),
+                        ".claude/settings.json",
+                    )
+                )
+            for label, fence, rel in sources:
+                if not (fence.root / rel).is_file():
                     continue
                 try:
-                    hooks = json.loads(path.read_text()).get("hooks") or {}
+                    hooks = _bounded_json(fence, rel, stores.max_read_bytes).get("hooks") or {}
                 except ValueError:
                     continue
                 if hooks:
