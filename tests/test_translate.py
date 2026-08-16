@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import secrets
 
+import pytest
+
 from claude_bridge import translate as tr
 
 
@@ -52,6 +54,15 @@ def test_translate_skill_refuses_anthropic_material(tmp_path):
     assert tr.translate_skill_dir(lic) is None
 
 
+def test_translate_skill_refuses_truncated_license_notice(tmp_path):
+    skill = tmp_path / "licensed-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: licensed-skill\ndescription: Licensed.\n---\n\nBody.\n")
+    (skill / "NOTICE").write_text("x" * 128 + "Anthropic material")
+
+    assert tr.translate_skill_dir(skill, max_bytes=128) is None
+
+
 def test_translate_skill_refuses_symlinked_root_escape(tmp_path):
     marker = secrets.token_urlsafe(24)
     outside = tmp_path / "outside-skill"
@@ -77,6 +88,16 @@ def test_translate_skill_refuses_symlinked_supporting_file_escape(tmp_path):
     assert translated is not None
     assert marker.encode() not in translated.files.values()
     assert "linked.txt" not in translated.files
+
+
+def test_translate_skill_refuses_truncated_supporting_file(tmp_path):
+    skill = tmp_path / "skill"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: safe-skill\ndescription: Safe.\n---\n\nBody.\n")
+    (skill / "scripts" / "run.py").write_bytes(b"x" * 129)
+
+    with pytest.raises(ValueError, match=r"scripts/run\.py exceeds max_read_bytes=128"):
+        tr.translate_skill_dir(skill, max_bytes=128)
 
 
 def test_translate_command_becomes_slash_skill(tmp_path):
