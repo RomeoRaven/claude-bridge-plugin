@@ -54,6 +54,15 @@ def test_translate_skill_refuses_anthropic_material(tmp_path):
     assert tr.translate_skill_dir(lic) is None
 
 
+def test_translate_skill_accepts_long_non_anthropic_license(tmp_path):
+    skill = tmp_path / "licensed-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: licensed-skill\ndescription: Licensed.\n---\n\nBody.\n")
+    (skill / "LICENSE").write_text("MIT License\n" + "Permission is hereby granted.\n" * 100)
+
+    assert tr.translate_skill_dir(skill) is not None
+
+
 def test_translate_skill_refuses_truncated_license_notice(tmp_path):
     skill = tmp_path / "licensed-skill"
     skill.mkdir()

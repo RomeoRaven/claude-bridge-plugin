@@ -87,10 +87,14 @@ def is_anthropic_material(skill_dir: Path, meta: dict, max_bytes: int = 65536) -
     for candidate in ("LICENSE.txt", "LICENSE", "LICENSE.md", "NOTICE"):
         if (skill_dir / candidate).is_file():
             try:
-                head, truncated = fence.read_text(candidate, min(max_bytes, 2000))
+                head, preview_truncated = fence.read_text(candidate, min(max_bytes, 2000))
+                if preview_truncated and max_bytes > 2000:
+                    _content, over_limit = fence.read_bytes(candidate, max_bytes)
+                else:
+                    over_limit = preview_truncated
             except (OSError, ValueError):
                 return True  # unreadable or escaped license = do not import
-            if truncated or "anthropic" in head.lower():
+            if over_limit or "anthropic" in head.lower():
                 return True
     return False
 
