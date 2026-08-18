@@ -7,12 +7,24 @@ from urllib.parse import urlsplit, urlunsplit
 from .stores import FencedRoot
 
 
+class ReadLimitExceeded(ValueError):
+    """A fenced read was safe but exceeded its configured byte budget."""
+
+
 def complete_text(fence: FencedRoot, rel: str, max_bytes: int) -> str:
     """Read one complete fenced text file or refuse a truncated result."""
     text, truncated = fence.read_text(rel, max_bytes)
     if truncated:
-        raise ValueError(f"{rel} exceeds max_read_bytes={max_bytes}")
+        raise ReadLimitExceeded(f"{rel} exceeds max_read_bytes={max_bytes}")
     return text
+
+
+def complete_bytes(fence: FencedRoot, rel: str, max_bytes: int) -> bytes:
+    """Read one complete fenced binary file or refuse a truncated result."""
+    content, truncated = fence.read_bytes(rel, max_bytes)
+    if truncated:
+        raise ReadLimitExceeded(f"{rel} exceeds max_read_bytes={max_bytes}")
+    return content
 
 
 def credential_free_url(value: object, *, invalid: str = "") -> str:

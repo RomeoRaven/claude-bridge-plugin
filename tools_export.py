@@ -58,7 +58,7 @@ def build_export_tools(cfg: dict) -> list:
                 current working directory.
             apply: actually write the file.
         """
-        proj = Path(project_dir).expanduser() if project_dir.strip() else None
+        proj = Path(project_dir).expanduser().resolve() if project_dir.strip() else None
         project_fence = FencedRoot("project", proj) if proj is not None else None
 
         translated_skills = []
@@ -86,7 +86,8 @@ def build_export_tools(cfg: dict) -> list:
                 warnings.append(f"subagent {md.stem}: {exc} (skipped)")
 
         servers: list[dict] = []
-        raw = _claude_mcp_servers(stores, project_fence)
+        raw, mcp_source_warnings = _claude_mcp_servers(stores, project_fence)
+        warnings.extend(mcp_source_warnings)
         if raw:
             servers, mcp_warnings = tr.translate_mcp_servers(raw)
             warnings.extend(mcp_warnings)
@@ -106,10 +107,9 @@ def build_export_tools(cfg: dict) -> list:
             if found is not None:
                 mem_dir = found[1] / "memory"
                 if mem_dir.is_dir():
-                    try:
-                        memory = tr.memory_chunks(mem_dir, stores.max_read_bytes)
-                    except ValueError as exc:
-                        warnings.append(f"project memory: {exc} (skipped)")
+                    memory_problems: list[str] = []
+                    memory = tr.memory_chunks(mem_dir, stores.max_read_bytes, memory_problems)
+                    warnings.extend(f"project memory: {problem}" for problem in memory_problems)
 
         data, plan = eb.build_bundle(
             agent_name=name,
@@ -135,23 +135,24 @@ def build_export_tools(cfg: dict) -> list:
     return [claude_export_snapshot]
 
 
-def _claude_mcp_servers(stores: ClaudeStores, project: FencedRoot | None) -> dict:
+def _claude_mcp_servers(stores: ClaudeStores, project: FencedRoot | None) -> tuple[dict, list[str]]:
     """The same two sources ``claude_import_mcp`` reads — user `settings.json` then the
     project's `.mcp.json`, project winning. Duplicated deliberately rather than refactored
     out of the import tool: that one is async and threads through an apply path, and export
     only needs the read. If a third caller appears, hoist it into ``stores``."""
     out: dict = {}
+    warnings: list[str] = []
     settings = stores.cli.root / "settings.json"
     if settings.is_file():
         try:
             out.update(_bounded_json(stores.cli, "settings.json", stores.max_read_bytes).get("mcpServers") or {})
-        except (ValueError, OSError):
-            pass
+        except (ValueError, OSError) as exc:
+            warnings.append(f"settings.json: {exc} (MCP servers skipped)")
     if project is not None:
         mcp_json = project.root / ".mcp.json"
         if mcp_json.is_file():
             try:
                 out.update(_bounded_json(project, ".mcp.json", stores.max_read_bytes).get("mcpServers") or {})
-            except (ValueError, OSError):
-                pass
-    return out
+            except (ValueError, OSError) as exc:
+                warnings.append(f"project .mcp.json: {exc} (MCP servers skipped)")
+    return out, warnings

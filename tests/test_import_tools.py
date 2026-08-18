@@ -78,6 +78,21 @@ def test_scan_finds_everything_and_excludes_anthropic(import_tools):
     assert "memory: 1 topic" in out
 
 
+def test_scan_continues_after_oversized_memory_topic(fake_home, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    project = next((tmp_path / "dot-claude" / "projects").iterdir())
+    (project / "memory" / "m-oversized.md").write_text("x" * 129)
+    capped = dict(fake_home, max_read_bytes=128)
+    tool = {item.name: item for item in build_import_tools(capped)}["claude_import_scan"]
+
+    out = tool.invoke({"project_dir": PROJECT_DIR})
+
+    assert "demo-skill" in out
+    assert "memory: 1 topic files" in out
+    assert "m-oversized.md: REFUSED" in out
+
+
 def test_scan_continues_after_first_oversized_skill(fake_home, tmp_path):
     from claude_bridge.tools_import import build_import_tools
 
@@ -156,6 +171,23 @@ async def test_skill_import_honors_configured_read_cap(fake_home, fake_host, tmp
     assert "max_read_bytes" in out
 
 
+async def test_cowork_skills_fail_closed_when_manifest_exceeds_read_cap(fake_home, fake_host, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    manifest = next((tmp_path / "cowork").glob("skills-plugin/*/*/manifest.json"))
+    manifest.write_text(manifest.read_text() + " " * 129)
+    capped = dict(fake_home, max_read_bytes=128)
+    tools = {item.name: item for item in build_import_tools(capped)}
+
+    scan = tools["claude_import_scan"].invoke({})
+    imported = await tools["claude_import_skills"].ainvoke({"names": "all", "source": "cowork", "apply": True})
+
+    assert "unverifiable" in scan
+    assert "my-writing-style" in scan and "docx" in scan
+    assert imported == "no matching skills in source 'cowork'"
+    assert not list(fake_host["skills_root"].iterdir())
+
+
 async def test_skills_dry_run_writes_nothing(import_tools, fake_host):
     out = await import_tools["claude_import_skills"].ainvoke({"names": "all", "source": "cowork"})
     assert "DRY RUN" in out and "my-writing-style" in out
@@ -177,11 +209,61 @@ async def test_skills_apply_never_overwrites(import_tools, fake_host):
     assert "skipped 'my-writing-style'" in out
 
 
+async def test_command_import_continues_after_middle_oversized_file(fake_home, fake_host, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    commands = tmp_path / "dot-claude" / "commands"
+    (commands / "a-first.md").write_text("---\ndescription: First.\n---\n\nFirst.\n")
+    (commands / "m-oversized.md").write_text("x" * 129)
+    (commands / "z-later.md").write_text("---\ndescription: Later.\n---\n\nLater.\n")
+    capped = dict(fake_home, max_read_bytes=128)
+    tool = {item.name: item for item in build_import_tools(capped)}["claude_import_commands"]
+
+    out = await tool.ainvoke({"names": "a-first,m-oversized,z-later", "apply": True})
+
+    assert "imported skill 'a-first'" in out
+    assert "m-oversized: REFUSED" in out
+    assert "imported skill 'z-later'" in out
+    assert (fake_host["skills_root"] / "a-first").is_dir()
+    assert not (fake_host["skills_root"] / "m-oversized").exists()
+    assert (fake_host["skills_root"] / "z-later").is_dir()
+
+
 async def test_commands_become_slash_skills(import_tools, fake_host):
     out = await import_tools["claude_import_commands"].ainvoke({"names": "standup", "apply": True})
     assert "imported skill 'standup'" in out
     text = (fake_host["skills_root"] / "standup" / "SKILL.md").read_text()
     assert "slash: standup" in text and "user_facing: true" in text
+
+
+async def test_subagent_import_continues_after_oversized_file(fake_home, fake_host, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    agents = tmp_path / "dot-claude" / "agents"
+    (agents / "a-first.md").write_text("---\nname: a-first\ndescription: First.\n---\n\nFirst.\n")
+    (agents / "m-oversized.md").write_text("x" * 129)
+    (agents / "z-later.md").write_text("---\nname: z-later\ndescription: Later.\n---\n\nLater.\n")
+    capped = dict(fake_home, max_read_bytes=128)
+    tool = {item.name: item for item in build_import_tools(capped)}["claude_import_subagents"]
+
+    out = await tool.ainvoke({"names": "a-first,m-oversized,z-later", "apply": True})
+
+    assert "m-oversized: REFUSED" in out
+    applied = fake_host["applied"][-1]["claude_bridge"]["imported_subagents"]
+    assert [row["name"] for row in applied] == ["a-first", "z-later"]
+
+
+async def test_subagent_import_reports_refusal_when_every_selected_file_is_oversized(fake_home, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    oversized = tmp_path / "dot-claude" / "agents" / "only-oversized.md"
+    oversized.write_text("x" * 129)
+    capped = dict(fake_home, max_read_bytes=128)
+    tool = {item.name: item for item in build_import_tools(capped)}["claude_import_subagents"]
+
+    out = await tool.ainvoke({"names": "only-oversized", "apply": True})
+
+    assert out == "- only-oversized: REFUSED (only-oversized.md exceeds max_read_bytes=128)"
 
 
 async def test_subagents_persist_via_plugin_config(import_tools, fake_host):
@@ -242,6 +324,23 @@ async def test_mcp_reports_hide_stdio_argument_values_without_changing_applied_c
     assert configured["args"] == full_args
 
 
+async def test_memory_import_continues_after_oversized_topic(fake_home, fake_host, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    project = next((tmp_path / "dot-claude" / "projects").iterdir())
+    memory = project / "memory"
+    (memory / "m-oversized.md").write_text("x" * 129)
+    (memory / "z-later.md").write_text("---\nname: z-later\n---\n\nLater fact.\n")
+    capped = dict(fake_home, max_read_bytes=128)
+    tool = {item.name: item for item in build_import_tools(capped)}["claude_import_memory"]
+
+    out = await tool.ainvoke({"directory": PROJECT_DIR, "apply": True})
+
+    assert "ingested 2/2" in out
+    assert "m-oversized.md exceeds max_read_bytes=128" in out
+    assert [heading for _domain, heading, _content in fake_host["chunks"]] == ["a-fact", "z-later"]
+
+
 async def test_memory_import_ingests_with_provenance(import_tools, fake_host):
     dry = await import_tools["claude_import_memory"].ainvoke({"directory": PROJECT_DIR})
     assert "DRY RUN" in dry and "1 topic" in dry
@@ -265,6 +364,18 @@ async def test_claude_md_import_ingests_operating_instructions(import_tools, fak
     assert domain == "claude-import"
     assert "Operating instructions" in heading
     assert "python -m server" in content and "imported from claude-code CLAUDE.md" in content
+
+
+async def test_claude_md_over_read_cap_is_refused_cleanly(fake_home, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    (tmp_path / "CLAUDE.md").write_text("x" * 129)
+    capped = dict(fake_home, max_read_bytes=128)
+    tool = {item.name: item for item in build_import_tools(capped)}["claude_import_claude_md"]
+
+    out = await tool.ainvoke({"directory": str(tmp_path), "apply": True})
+
+    assert out == "CLAUDE.md: REFUSED (CLAUDE.md exceeds max_read_bytes=128)"
 
 
 async def test_claude_md_missing_is_a_clean_noop(import_tools, fake_host, tmp_path):

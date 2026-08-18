@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from .boundaries import complete_text
+from .boundaries import ReadLimitExceeded, complete_bytes, complete_text
 from .stores import FencedRoot
 
 # Agent Skills spec (agentskills.io/specification): 1-64 chars, lowercase
@@ -140,11 +140,11 @@ def translate_skill_dir(src: Path, source: str = "claude-code", max_bytes: int =
     if not skill_md.is_file():
         return None
     try:
-        skill_text, skill_truncated = fence.read_text("SKILL.md", max_bytes)
+        skill_text = complete_text(fence, "SKILL.md", max_bytes)
+    except ReadLimitExceeded:
+        raise
     except (OSError, ValueError):
         return None
-    if skill_truncated:
-        raise ValueError(f"SKILL.md exceeds max_read_bytes={max_bytes}")
     meta, body = parse_frontmatter(skill_text)
     if is_anthropic_material(src, meta, max_bytes):
         return None
@@ -180,11 +180,11 @@ def translate_skill_dir(src: Path, source: str = "claude-code", max_bytes: int =
         rel = p.relative_to(src)
         if p.is_file() and str(rel) != "SKILL.md":
             try:
-                content, truncated = fence.read_bytes(str(rel), max_bytes)
+                content = complete_bytes(fence, str(rel), max_bytes)
+            except ReadLimitExceeded:
+                raise
             except (OSError, ValueError):
                 continue
-            if truncated:
-                raise ValueError(f"{rel} exceeds max_read_bytes={max_bytes}")
             out.files[str(rel)] = content
     return out
 
@@ -295,7 +295,7 @@ def translate_mcp_servers(cc_servers: dict) -> tuple[list[dict], list[str]]:
     return entries, warnings
 
 
-def memory_chunks(memory_dir: Path, max_bytes: int = 65536) -> list[tuple[str, str]]:
+def memory_chunks(memory_dir: Path, max_bytes: int = 65536, problems: list[str] | None = None) -> list[tuple[str, str]]:
     """A Claude Code project memory dir → (heading, content) chunks for
     knowledge ingestion. One chunk per topic file; MEMORY.md (the index) is
     derivative and skipped. Frontmatter is folded into the heading."""
@@ -304,9 +304,13 @@ def memory_chunks(memory_dir: Path, max_bytes: int = 65536) -> list[tuple[str, s
     for f in sorted(memory_dir.glob("*.md")):
         if f.name == "MEMORY.md":
             continue
-        text, truncated = fence.read_text(f.name, max_bytes)
-        if truncated:
-            raise ValueError(f"{f.name} exceeds max_read_bytes={max_bytes}")
+        try:
+            text = complete_text(fence, f.name, max_bytes)
+        except (OSError, ValueError) as exc:
+            if problems is None:
+                raise
+            problems.append(f"{f.name}: REFUSED ({exc})")
+            continue
         meta, body = parse_frontmatter(text)
         heading = str(meta.get("description") or meta.get("name") or f.stem)
         content = body.strip()

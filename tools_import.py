@@ -25,6 +25,19 @@ def _bounded_json(fence: FencedRoot, rel: str, max_bytes: int) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _safe_resolved_paths(fence: FencedRoot, paths, *, directories: bool) -> list[Path]:
+    safe: list[Path] = []
+    for path in paths:
+        try:
+            candidate = fence.resolve(str(path.relative_to(fence.root)))
+        except (OSError, ValueError):
+            continue
+        matches_kind = candidate.is_dir() if directories else candidate.is_file()
+        if matches_kind:
+            safe.append(candidate)
+    return safe
+
+
 def _safe_markdown_files(fence: FencedRoot, rel_dir: str) -> list[Path]:
     try:
         root = fence.resolve(rel_dir)
@@ -32,30 +45,24 @@ def _safe_markdown_files(fence: FencedRoot, rel_dir: str) -> list[Path]:
         return []
     if not root.is_dir():
         return []
-    safe: list[Path] = []
-    for path in sorted(root.glob("*.md")):
-        try:
-            candidate = fence.resolve(str(path.relative_to(fence.root)))
-        except (OSError, ValueError):
-            continue
-        if candidate.is_file():
-            safe.append(candidate)
-    return safe
+    return _safe_resolved_paths(fence, sorted(root.glob("*.md")), directories=False)
 
 
-def _cowork_manifest_types(stores: ClaudeStores) -> dict[str, str]:
-    """skill name → creatorType from every fenced Cowork manifest."""
+def _cowork_manifest_types(stores: ClaudeStores) -> tuple[dict[str, str], set[Path]]:
+    """Return creator types plus account roots whose manifest cannot be trusted."""
     out: dict[str, str] = {}
+    unverifiable: set[Path] = set()
     for manifest in stores.cowork.root.glob("skills-plugin/*/*/manifest.json"):
         try:
             rel = str(manifest.relative_to(stores.cowork.root))
             data = _bounded_json(stores.cowork, rel, stores.max_read_bytes)
         except (ValueError, OSError):
+            unverifiable.add(manifest.parent.resolve())
             continue
         for s in data.get("skills") or []:
             if isinstance(s, dict) and s.get("name"):
                 out[s["name"]] = str(s.get("creatorType") or "")
-    return out
+    return out, unverifiable
 
 
 def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, str]], list[str]]:
@@ -65,17 +72,6 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
     Anthropic-authored skills (`creatorType: anthropic`) — those never enter
     the candidate list, only the excluded report."""
 
-    def _safe_dirs(fence: FencedRoot, paths) -> list[Path]:
-        safe: list[Path] = []
-        for path in paths:
-            try:
-                candidate = fence.resolve(str(path.relative_to(fence.root)))
-            except (OSError, ValueError):
-                continue
-            if candidate.is_dir():
-                safe.append(candidate)
-        return safe
-
     if source == "user":
         try:
             root = stores.cli.resolve("skills")
@@ -83,13 +79,19 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
             return [], []
         if not root.is_dir():
             return [], []
-        return [(p, "claude-code:user") for p in _safe_dirs(stores.cli, sorted(root.iterdir()))], []
+        return [
+            (p, "claude-code:user") for p in _safe_resolved_paths(stores.cli, sorted(root.iterdir()), directories=True)
+        ], []
     if source == "cowork":
-        types = _cowork_manifest_types(stores)
+        types, unverifiable = _cowork_manifest_types(stores)
         candidates, excluded = [], []
-        paths = _safe_dirs(stores.cowork, sorted(stores.cowork.root.glob("skills-plugin/*/*/skills/*")))
+        paths = _safe_resolved_paths(
+            stores.cowork, sorted(stores.cowork.root.glob("skills-plugin/*/*/skills/*")), directories=True
+        )
         for p in paths:
-            if types.get(p.name, "").lower() == "anthropic":
+            if p.parent.parent.resolve() in unverifiable:
+                excluded.append(f"{p.name} (unverifiable manifest)")
+            elif types.get(p.name, "").lower() == "anthropic":
                 excluded.append(p.name)
             else:
                 candidates.append((p, "claude-cowork"))
@@ -102,7 +104,9 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
         return [], []
     if not root.is_dir():
         return [], []
-    return [(p, f"claude-code:{source}") for p in _safe_dirs(project, sorted(root.iterdir()))], []
+    return [
+        (p, f"claude-code:{source}") for p in _safe_resolved_paths(project, sorted(root.iterdir()), directories=True)
+    ], []
 
 
 def _pick(names: str, available: list[str]) -> list[str]:
@@ -143,7 +147,9 @@ def build_import_tools(cfg: dict) -> list:
                 if names or excluded or refused:
                     lines.append(f"skills [{source}]: {', '.join(names) or '(none)'}")
                     if excluded:
-                        lines.append(f"  excluded (Anthropic-licensed, never imported): {', '.join(excluded)}")
+                        lines.append(
+                            f"  excluded (Anthropic-licensed or unverifiable, never imported): {', '.join(excluded)}"
+                        )
                     if refused:
                         lines.append(f"  refused: {', '.join(refused)}")
             cmds = [p.stem for p in _safe_markdown_files(stores.cli, "commands")]
@@ -183,12 +189,14 @@ def build_import_tools(cfg: dict) -> list:
             if project_dir:
                 found = stores.find_project(project_dir)
                 if found:
+                    memory_problems: list[str] = []
                     n = (
-                        len(tr.memory_chunks(found[1] / "memory", stores.max_read_bytes))
+                        len(tr.memory_chunks(found[1] / "memory", stores.max_read_bytes, memory_problems))
                         if (found[1] / "memory").is_dir()
                         else 0
                     )
                     lines.append(f"memory: {n} topic files for {project_dir}")
+                    lines += [f"  refused: {problem}" for problem in memory_problems]
             return "\n".join(lines) if lines else "nothing importable found"
         except Exception as exc:  # noqa: BLE001
             return f"error: {exc}"
@@ -250,7 +258,11 @@ def build_import_tools(cfg: dict) -> list:
             for p in files:
                 if p.stem not in chosen:
                     continue
-                translated = tr.translate_command_md(p, max_bytes=stores.max_read_bytes)
+                try:
+                    translated = tr.translate_command_md(p, max_bytes=stores.max_read_bytes)
+                except (OSError, ValueError) as exc:
+                    results.append(f"- {p.stem}: REFUSED ({exc})")
+                    continue
                 for w in translated.warnings:
                     results.append(f"  note ({translated.name}): {w}")
                 if apply and target is not None:
@@ -283,12 +295,16 @@ def build_import_tools(cfg: dict) -> list:
             for p in files:
                 if p.stem not in chosen:
                     continue
-                s = tr.translate_subagent_md(p, max_bytes=stores.max_read_bytes)
+                try:
+                    s = tr.translate_subagent_md(p, max_bytes=stores.max_read_bytes)
+                except (OSError, ValueError) as exc:
+                    results.append(f"- {p.stem}: REFUSED ({exc})")
+                    continue
                 subs.append(s)
                 results.append(f"- {s.name}: tools={s.tools or '(text-only)'}")
                 results += [f"  note: {w}" for w in s.warnings]
             if not subs:
-                return "no matching subagents found"
+                return "\n".join(results) if results else "no matching subagents found"
             if apply:
                 ok, messages = await importer.apply_subagents(subs)
                 results += [f"- {m}" for m in messages]
@@ -363,19 +379,27 @@ def build_import_tools(cfg: dict) -> list:
             found = stores.find_project(directory)
             if not found or not (found[1] / "memory").is_dir():
                 return f"no Claude Code memory for {directory!r}"
-            chunks = tr.memory_chunks(found[1] / "memory", stores.max_read_bytes)
+            read_problems: list[str] = []
+            chunks = tr.memory_chunks(found[1] / "memory", stores.max_read_bytes, read_problems)
             if int(limit) > 0:
                 chunks = chunks[: int(limit)]
             if not chunks:
-                return "memory directory is empty"
+                out = "memory directory has no importable topics"
+                if read_problems:
+                    out += "\nproblems:\n" + "\n".join(f"- {p}" for p in read_problems[:10])
+                return out
             if not apply:
                 listing = "\n".join(f"- {h} ({len(c)} chars)" for h, c in chunks[:40])
-                return (
+                out = (
                     f"DRY RUN — {len(chunks)} topic file(s) would be ingested into knowledge "
                     f"domain 'claude-import' (re-run with apply=True after the operator approves):\n{listing}"
                 )
-            added, problems = await importer.ingest_memory(chunks, source_label=f"claude-code {directory}")
+                if read_problems:
+                    out += "\nproblems:\n" + "\n".join(f"- {p}" for p in read_problems[:10])
+                return out
+            added, ingest_problems = await importer.ingest_memory(chunks, source_label=f"claude-code {directory}")
             out = f"ingested {added}/{len(chunks)} memory topics into domain 'claude-import'"
+            problems = read_problems + ingest_problems
             if problems:
                 out += "\nproblems:\n" + "\n".join(f"- {p}" for p in problems[:10])
             return out
@@ -399,7 +423,10 @@ def build_import_tools(cfg: dict) -> list:
             if not claude_md.is_file():
                 return f"no CLAUDE.md in {directory!r}"
             project_fence = FencedRoot("project", project)
-            content = complete_text(project_fence, "CLAUDE.md", stores.max_read_bytes).strip()
+            try:
+                content = complete_text(project_fence, "CLAUDE.md", stores.max_read_bytes).strip()
+            except (OSError, ValueError) as exc:
+                return f"CLAUDE.md: REFUSED ({exc})"
             if not content:
                 return "CLAUDE.md is empty"
             heading = f"Operating instructions (CLAUDE.md) — {project.name}"

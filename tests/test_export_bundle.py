@@ -18,6 +18,7 @@ import claude_bridge  # noqa: F401 — registers the synthetic package (conftest
 import pytest
 import yaml
 from claude_bridge.export_bundle import SNAPSHOT_VERSION, build_bundle, manifest_of
+from claude_bridge.stores import project_slug_candidates
 from claude_bridge.tools_export import build_export_tools
 from claude_bridge.translate import TranslatedSkill, TranslatedSubagent
 
@@ -261,6 +262,26 @@ class TestExportTool:
         assert "The fact body." in memory
         assert "NOT publishable" in result
 
+    def test_include_memory_accepts_relative_project_dir(self, fake_home, tmp_path, monkeypatch):
+        project = tmp_path / "project"
+        project.mkdir()
+        slug = project_slug_candidates(str(project.resolve()))[0]
+        memory = Path(fake_home["cli_root"]) / "projects" / slug / "memory"
+        memory.mkdir(parents=True)
+        (memory / "fact.md").write_text("---\nname: relative-fact\n---\n\nRelative memory.\n")
+        out = tmp_path / "bundles"
+        monkeypatch.chdir(project)
+
+        result = self._tool(fake_home).invoke(
+            {"project_dir": ".", "include_memory": True, "out": str(out), "apply": True}
+        )
+
+        written = next(out.glob("*.zip"))
+        with zipfile.ZipFile(written) as archive:
+            exported = archive.read("knowledge/claude-import.md").decode()
+        assert "Relative memory." in exported
+        assert "NOT publishable" in result
+
     def test_export_honors_configured_read_cap(self, fake_home, tmp_path):
         marker = secrets.token_urlsafe(24)
         skill_md = Path(fake_home["cli_root"]) / "skills" / "demo-skill" / "SKILL.md"
@@ -275,6 +296,16 @@ class TestExportTool:
 
         assert marker.encode() not in decompressed
         assert "max_read_bytes" in result
+
+    def test_oversized_mcp_settings_are_reported_not_silently_omitted(self, fake_home):
+        settings = Path(fake_home["cli_root"]) / "settings.json"
+        settings.write_text(settings.read_text() + " " * 129)
+        capped = dict(fake_home, max_read_bytes=128)
+
+        result = build_export_tools(capped)[0].invoke({})
+
+        assert "settings.json exceeds max_read_bytes=128" in result
+        assert "MCP servers      0" in result
 
     def test_the_reply_tells_the_operator_to_read_the_review(self, fake_home, tmp_path):
         res = self._tool(fake_home).invoke({"out": str(tmp_path), "apply": True})
