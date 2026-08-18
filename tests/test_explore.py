@@ -131,3 +131,18 @@ def test_inventory_project_level(tools, tmp_path):
     assert "docs" in out and marker not in out
     assert "url=https://x.test/mcp" in out
     assert "CLAUDE.md: present" in out
+
+
+def test_inventory_accepts_relative_project_dir_without_losing_user_sections(tools, tmp_path, monkeypatch):
+    proj = tmp_path / "relative-project"
+    (proj / ".claude" / "agents").mkdir(parents=True)
+    (proj / ".claude" / "agents" / "local.md").write_text(
+        "---\nname: local\ndescription: Relative project agent.\n---\n\nPrompt.\n"
+    )
+    monkeypatch.chdir(proj)
+
+    out = tools["claude_inventory"].invoke({"project_dir": "."})
+
+    assert not out.startswith("error:")
+    assert "demo-skill" in out
+    assert "local" in out

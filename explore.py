@@ -438,7 +438,7 @@ def build_explore_tools(cfg: dict) -> list:
                     sections.append("settings: (unreadable)")
 
             if project_dir:
-                proj = Path(project_dir).expanduser()
+                proj = Path(project_dir).expanduser().resolve()
                 project_fence = FencedRoot("project", proj)
                 sections.append(f"— project level: {proj} —")
                 dot = proj / ".claude"
