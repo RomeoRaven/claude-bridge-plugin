@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
-
 from langchain_core.tools import tool
 
+from .boundaries import credential_free_url
 from .stores import ClaudeStores, FencedRoot, project_slug_candidates
 
 _LIST_CAP = 40
@@ -66,22 +65,6 @@ def _frontmatter(text: str) -> dict:
         return {}
 
 
-def _credential_free_url(value: object) -> str:
-    raw = str(value or "").strip()
-    try:
-        parsed = urlsplit(raw)
-        host = parsed.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        port = parsed.port
-        netloc = host + (f":{port}" if port is not None else "")
-        if not parsed.scheme or not netloc:
-            return "[redacted]"
-        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-    except ValueError:
-        return "[redacted]"
-
-
 def _redact_mcp(servers) -> list[str]:
     """Describe MCP server entries without echoing env values, headers, or URLs' secrets."""
     out = []
@@ -95,7 +78,7 @@ def _redact_mcp(servers) -> list[str]:
         if entry.get("command"):
             bits.append(f"command={entry['command']} args={len(entry.get('args') or [])}")
         if entry.get("url"):
-            bits.append(f"url={_credential_free_url(entry['url'])}")
+            bits.append(f"url={credential_free_url(entry['url'], invalid='[redacted]')}")
         env_keys = sorted((entry.get("env") or {}).keys())
         if env_keys:
             bits.append(f"env keys={env_keys}")
@@ -368,7 +351,7 @@ def build_explore_tools(cfg: dict) -> list:
             cli = stores.cli.root
             sections: list[str] = []
 
-            def _bounded_text(fence: FencedRoot, rel: str, label: str) -> str | None:
+            def _inventory_text(fence: FencedRoot, rel: str, label: str) -> str | None:
                 try:
                     text, truncated = fence.read_text(rel, stores.max_read_bytes)
                 except (OSError, ValueError):
@@ -409,7 +392,7 @@ def build_explore_tools(cfg: dict) -> list:
             installed = cli / "plugins" / "installed_plugins.json"
             if installed.is_file():
                 try:
-                    raw = _bounded_text(stores.cli, "plugins/installed_plugins.json", "installed plugins")
+                    raw = _inventory_text(stores.cli, "plugins/installed_plugins.json", "installed plugins")
                     data = json.loads(raw) if raw is not None else {}
                     plugins = data.get("plugins")
                     names = sorted(plugins.keys()) if isinstance(plugins, dict) else []
@@ -421,7 +404,7 @@ def build_explore_tools(cfg: dict) -> list:
             settings = cli / "settings.json"
             if settings.is_file():
                 try:
-                    raw = _bounded_text(stores.cli, "settings.json", "settings")
+                    raw = _inventory_text(stores.cli, "settings.json", "settings")
                     data = json.loads(raw) if raw is not None else {}
                     bits = []
                     if data.get("model"):
@@ -448,7 +431,7 @@ def build_explore_tools(cfg: dict) -> list:
                 psettings = dot / "settings.json"
                 if psettings.is_file():
                     try:
-                        raw = _bounded_text(project_fence, ".claude/settings.json", "project settings")
+                        raw = _inventory_text(project_fence, ".claude/settings.json", "project settings")
                         data = json.loads(raw) if raw is not None else {}
                         hooks = data.get("hooks")
                         if raw is not None and isinstance(hooks, dict):
@@ -458,7 +441,7 @@ def build_explore_tools(cfg: dict) -> list:
                 mcp = proj / ".mcp.json"
                 if mcp.is_file():
                     try:
-                        raw = _bounded_text(project_fence, ".mcp.json", "project .mcp.json")
+                        raw = _inventory_text(project_fence, ".mcp.json", "project .mcp.json")
                         data = json.loads(raw) if raw is not None else {}
                         if raw is not None:
                             sections.append(
@@ -467,7 +450,7 @@ def build_explore_tools(cfg: dict) -> list:
                     except ValueError:
                         sections.append("project .mcp.json: (unreadable)")
                 if (proj / "CLAUDE.md").is_file():
-                    raw = _bounded_text(project_fence, "CLAUDE.md", "CLAUDE.md")
+                    raw = _inventory_text(project_fence, "CLAUDE.md", "CLAUDE.md")
                     if raw is not None:
                         heading = next((ln for ln in raw.splitlines() if ln.strip()), "")
                         sections.append(f"CLAUDE.md: present ({_snippet(heading, 80)})")

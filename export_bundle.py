@@ -55,30 +55,14 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+
+from .boundaries import credential_free_url
 
 SNAPSHOT_MANIFEST = "agent.snapshot.yaml"
 #: The ADR 0091 schema version this emits. Bumping protoAgent's version without bumping
 #: this is how the two silently drift — an importer refuses an unknown version outright, so
 #: a mismatch is loud rather than subtly wrong.
 SNAPSHOT_VERSION = 1
-
-
-def _credential_free_url(value: object) -> str:
-    """Keep an endpoint's location while removing credential-bearing URL parts."""
-    raw = str(value or "").strip()
-    try:
-        parsed = urlsplit(raw)
-        host = parsed.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        port = parsed.port
-        netloc = host + (f":{port}" if port is not None else "")
-        if not parsed.scheme or not netloc:
-            return ""
-        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-    except ValueError:
-        return ""
 
 
 @dataclass
@@ -159,7 +143,7 @@ def _null_mcp_secrets(servers: list[dict]) -> tuple[list[dict], list[dict]]:
             )
         if entry.get("url"):
             original_url = str(entry["url"])
-            entry["url"] = _credential_free_url(original_url)
+            entry["url"] = credential_free_url(original_url)
             if entry["url"] != original_url:
                 required.append(
                     {

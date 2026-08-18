@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yaml
 
+from .boundaries import complete_text
 from .stores import FencedRoot
 
 # Agent Skills spec (agentskills.io/specification): 1-64 chars, lowercase
@@ -125,14 +126,6 @@ def _normalized_meta(name: str, description: str, source: str, extra: dict | Non
     return meta
 
 
-def _bounded_document(path: Path, max_bytes: int) -> str:
-    fence = FencedRoot("document", path.parent)
-    text, truncated = fence.read_text(path.name, max_bytes)
-    if truncated:
-        raise ValueError(f"{path.name} exceeds max_read_bytes={max_bytes}")
-    return text
-
-
 def translate_skill_dir(src: Path, source: str = "claude-code", max_bytes: int = 65536) -> TranslatedSkill | None:
     """A Claude Code skill directory → a protoAgent skill directory.
 
@@ -201,7 +194,7 @@ def translate_command_md(path: Path, source: str = "claude-code", max_bytes: int
     protoAgent user-facing slash skill (``user_facing: true`` + ``slash:``,
     ADR 0052). The body carries over verbatim; ``$ARGUMENTS`` semantics are
     documented in a translator note so the prompt still reads correctly."""
-    meta, body = parse_frontmatter(_bounded_document(path, max_bytes))
+    meta, body = parse_frontmatter(complete_text(FencedRoot("document", path.parent), path.name, max_bytes))
     out = TranslatedSkill(name=slugify_name(path.stem), user_facing=True, slash=slugify_name(path.stem))
     desc = str(meta.get("description") or "").strip()
     if not desc:
@@ -240,7 +233,7 @@ def translate_subagent_md(path: Path, max_bytes: int = 65536) -> TranslatedSubag
     flagged, never guessed); the model is recorded but left blank so the
     subagent inherits the instance's aux/main model (gateway aliases differ
     per instance)."""
-    meta, body = parse_frontmatter(_bounded_document(path, max_bytes))
+    meta, body = parse_frontmatter(complete_text(FencedRoot("document", path.parent), path.name, max_bytes))
     out = TranslatedSubagent(
         name=slugify_name(meta.get("name") or path.stem),
         description=str(meta.get("description") or "").strip()[:DESCRIPTION_MAX]

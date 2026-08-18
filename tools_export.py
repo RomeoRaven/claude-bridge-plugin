@@ -18,8 +18,9 @@ from langchain_core.tools import tool
 
 from . import export_bundle as eb
 from . import translate as tr
+from .boundaries import complete_text
 from .stores import ClaudeStores, FencedRoot
-from .tools_import import _bounded_json, _bounded_text, _pick, _safe_markdown_files, _skill_sources
+from .tools_import import _bounded_json, _pick, _safe_markdown_files, _skill_sources
 
 
 def build_export_tools(cfg: dict) -> list:
@@ -95,7 +96,7 @@ def build_export_tools(cfg: dict) -> list:
             cm = project_fence.root / "CLAUDE.md"
             if cm.is_file():
                 try:
-                    claude_md = _bounded_text(project_fence, "CLAUDE.md", stores.max_read_bytes)
+                    claude_md = complete_text(project_fence, "CLAUDE.md", stores.max_read_bytes)
                 except ValueError as exc:
                     warnings.append(f"CLAUDE.md: {exc} (skipped)")
 

@@ -14,21 +14,14 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-from .explore import _credential_free_url
+from .boundaries import complete_text, credential_free_url
 from .stores import ClaudeStores, FencedRoot
 from . import translate as tr
 from . import importer
 
 
-def _bounded_text(fence: FencedRoot, rel: str, max_bytes: int) -> str:
-    text, truncated = fence.read_text(rel, max_bytes)
-    if truncated:
-        raise ValueError(f"{rel} exceeds max_read_bytes={max_bytes}")
-    return text
-
-
 def _bounded_json(fence: FencedRoot, rel: str, max_bytes: int) -> dict:
-    data = json.loads(_bounded_text(fence, rel, max_bytes))
+    data = json.loads(complete_text(fence, rel, max_bytes))
     return data if isinstance(data, dict) else {}
 
 
@@ -135,18 +128,24 @@ def build_import_tools(cfg: dict) -> list:
             for source in ["user", "cowork"] + ([project_dir] if project_dir else []):
                 candidates, excluded = _skill_sources(stores, source)
                 names = []
+                refused = []
                 for d, _ in candidates:
-                    skill_fence = FencedRoot("skill", d)
-                    meta, _body = tr.parse_frontmatter(
-                        _bounded_text(skill_fence, "SKILL.md", stores.max_read_bytes)
-                        if (d / "SKILL.md").is_file()
-                        else ""
-                    )
-                    (excluded if tr.is_anthropic_material(d, meta, stores.max_read_bytes) else names).append(d.name)
-                if names or excluded:
+                    try:
+                        skill_fence = FencedRoot("skill", d)
+                        meta, _body = tr.parse_frontmatter(
+                            complete_text(skill_fence, "SKILL.md", stores.max_read_bytes)
+                            if (d / "SKILL.md").is_file()
+                            else ""
+                        )
+                        (excluded if tr.is_anthropic_material(d, meta, stores.max_read_bytes) else names).append(d.name)
+                    except (OSError, ValueError) as exc:
+                        refused.append(f"{d.name}: REFUSED ({exc})")
+                if names or excluded or refused:
                     lines.append(f"skills [{source}]: {', '.join(names) or '(none)'}")
                     if excluded:
                         lines.append(f"  excluded (Anthropic-licensed, never imported): {', '.join(excluded)}")
+                    if refused:
+                        lines.append(f"  refused: {', '.join(refused)}")
             cmds = [p.stem for p in _safe_markdown_files(stores.cli, "commands")]
             project_fence = FencedRoot("project", Path(project_dir).expanduser()) if project_dir else None
             if project_fence is not None:
@@ -169,9 +168,8 @@ def build_import_tools(cfg: dict) -> list:
                     )
                 except ValueError:
                     pass
-            if project_dir:
-                project_fence = FencedRoot("project", Path(project_dir).expanduser())
-                if (Path(project_dir).expanduser() / ".mcp.json").is_file():
+            if project_fence is not None:
+                if (project_fence.root / ".mcp.json").is_file():
                     try:
                         mcp_names += sorted(
                             (
@@ -212,7 +210,11 @@ def build_import_tools(cfg: dict) -> list:
             for d, label in candidates:
                 if d.name not in chosen:
                     continue
-                translated = tr.translate_skill_dir(d, source=label, max_bytes=stores.max_read_bytes)
+                try:
+                    translated = tr.translate_skill_dir(d, source=label, max_bytes=stores.max_read_bytes)
+                except (OSError, ValueError) as exc:
+                    results.append(f"- {d.name}: REFUSED ({exc})")
+                    continue
                 if translated is None:
                     results.append(f"- {d.name}: REFUSED (Anthropic-licensed or unreadable)")
                     continue
@@ -330,7 +332,7 @@ def build_import_tools(cfg: dict) -> list:
             for e in entries:
                 safe = {k: v for k, v in e.items() if k not in ("env", "headers", "args")}
                 if safe.get("url"):
-                    safe["url"] = _credential_free_url(safe["url"])
+                    safe["url"] = credential_free_url(safe["url"], invalid="[redacted]")
                 extras = []
                 if e.get("args"):
                     extras.append(f"args={len(e['args'])}")
@@ -397,7 +399,7 @@ def build_import_tools(cfg: dict) -> list:
             if not claude_md.is_file():
                 return f"no CLAUDE.md in {directory!r}"
             project_fence = FencedRoot("project", project)
-            content = _bounded_text(project_fence, "CLAUDE.md", stores.max_read_bytes).strip()
+            content = complete_text(project_fence, "CLAUDE.md", stores.max_read_bytes).strip()
             if not content:
                 return "CLAUDE.md is empty"
             heading = f"Operating instructions (CLAUDE.md) — {project.name}"

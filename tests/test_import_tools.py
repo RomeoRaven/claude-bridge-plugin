@@ -78,6 +78,51 @@ def test_scan_finds_everything_and_excludes_anthropic(import_tools):
     assert "memory: 1 topic" in out
 
 
+def test_scan_continues_after_first_oversized_skill(fake_home, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    skills = tmp_path / "dot-claude" / "skills"
+    oversized = skills / "a-oversized"
+    oversized.mkdir()
+    (oversized / "SKILL.md").write_text("x" * 129)
+    later = skills / "z-later"
+    later.mkdir()
+    (later / "SKILL.md").write_text("---\nname: z-later\ndescription: Later.\n---\n\nBody.\n")
+    capped = dict(fake_home, max_read_bytes=128)
+    tool = {item.name: item for item in build_import_tools(capped)}["claude_import_scan"]
+
+    out = tool.invoke({})
+
+    assert "a-oversized: REFUSED" in out
+    assert "z-later" in out
+
+
+async def test_skill_import_continues_after_middle_oversized_skill(fake_home, fake_host, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    skills = tmp_path / "dot-claude" / "skills"
+    first = skills / "a-first"
+    first.mkdir()
+    (first / "SKILL.md").write_text("---\nname: a-first\ndescription: First.\n---\n\nBody.\n")
+    oversized = skills / "m-oversized"
+    oversized.mkdir()
+    (oversized / "SKILL.md").write_text("x" * 129)
+    later = skills / "z-later"
+    later.mkdir()
+    (later / "SKILL.md").write_text("---\nname: z-later\ndescription: Later.\n---\n\nBody.\n")
+    capped = dict(fake_home, max_read_bytes=128)
+    tool = {item.name: item for item in build_import_tools(capped)}["claude_import_skills"]
+
+    out = await tool.ainvoke({"names": "all", "source": "user", "apply": True})
+
+    assert "imported skill 'a-first'" in out
+    assert "m-oversized: REFUSED" in out
+    assert "imported skill 'z-later'" in out
+    assert (fake_host["skills_root"] / "a-first").is_dir()
+    assert not (fake_host["skills_root"] / "m-oversized").exists()
+    assert (fake_host["skills_root"] / "z-later").is_dir()
+
+
 async def test_skill_import_refuses_symlinked_source_escape(fake_home, fake_host, tmp_path):
     from claude_bridge.tools_import import build_import_tools
 
