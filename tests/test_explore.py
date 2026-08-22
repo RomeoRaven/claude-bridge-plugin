@@ -110,6 +110,22 @@ def test_inventory_refuses_symlinked_skill_escape(tools, tmp_path):
     assert "outside" not in out
 
 
+def test_inventory_reports_symlinked_user_skills_root(fake_home, tmp_path):
+    from claude_bridge.explore import build_explore_tools
+
+    skills = Path(fake_home["cli_root"]) / "skills"
+    skills.rename(Path(fake_home["cli_root"]) / "skills-original")
+    outside = tmp_path / "outside-skills"
+    outside.mkdir()
+    skills.symlink_to(outside, target_is_directory=True)
+    inventory = {tool.name: tool for tool in build_explore_tools(fake_home)}["claude_inventory"]
+
+    out = inventory.invoke({})
+
+    assert "user skills" in out
+    assert "outside declared root" in out
+
+
 def test_inventory_project_level(tools, tmp_path):
     marker = secrets.token_urlsafe(24)
     proj = tmp_path / "someproj"

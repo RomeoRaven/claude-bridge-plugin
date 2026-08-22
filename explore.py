@@ -363,10 +363,15 @@ def build_explore_tools(cfg: dict) -> list:
                 return text
 
             def _md_listing(folder: Path, kind: str, fence: FencedRoot) -> None:
-                if not folder.is_dir():
+                try:
+                    safe_folder = fence.resolve(str(folder.relative_to(fence.root)))
+                except (OSError, ValueError):
+                    sections.append(f"{kind}: (unreadable or outside declared root)")
+                    return
+                if not safe_folder.is_dir():
                     return
                 rows = []
-                for p in sorted(folder.iterdir()):
+                for p in sorted(safe_folder.iterdir()):
                     rel = ""
                     if p.is_dir() and (p / "SKILL.md").is_file():
                         rel = str((p / "SKILL.md").relative_to(fence.root))

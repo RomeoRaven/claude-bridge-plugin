@@ -233,6 +233,7 @@ class TestExportTool:
     def test_the_plan_names_what_would_travel(self, fake_home):
         res = self._tool(fake_home).invoke({})
         assert "demo-skill" in res  # the fixture's user skill
+        assert "standup" in res  # the fixture's slash command translated as a user-facing skill
         assert "helper" in res  # the fixture's subagent
         assert "mcp.github.env.GH_TOKEN" in res  # the credential the importer must supply
 
@@ -306,6 +307,30 @@ class TestExportTool:
 
         assert "settings.json exceeds max_read_bytes=128" in result
         assert "MCP servers      0" in result
+
+    def test_symlinked_user_skills_root_is_reported_not_silently_omitted(self, fake_home, tmp_path):
+        skills = Path(fake_home["cli_root"]) / "skills"
+        skills.rename(Path(fake_home["cli_root"]) / "skills-original")
+        outside = tmp_path / "outside-skills"
+        outside.mkdir()
+        skills.symlink_to(outside, target_is_directory=True)
+
+        result = self._tool(fake_home).invoke({})
+
+        assert "user skills root" in result
+        assert "outside declared root" in result
+
+    def test_symlinked_user_commands_root_is_reported_not_silently_omitted(self, fake_home, tmp_path):
+        commands = Path(fake_home["cli_root"]) / "commands"
+        commands.rename(Path(fake_home["cli_root"]) / "commands-original")
+        outside = tmp_path / "outside-commands"
+        outside.mkdir()
+        commands.symlink_to(outside, target_is_directory=True)
+
+        result = self._tool(fake_home).invoke({})
+
+        assert "user commands root" in result
+        assert "outside declared root" in result
 
     def test_the_reply_tells_the_operator_to_read_the_review(self, fake_home, tmp_path):
         res = self._tool(fake_home).invoke({"out": str(tmp_path), "apply": True})

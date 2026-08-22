@@ -155,6 +155,44 @@ async def test_skill_import_refuses_symlinked_source_escape(fake_home, fake_host
     assert not (fake_host["skills_root"] / "outside").exists()
 
 
+def test_scan_reports_symlinked_user_skills_root(fake_home, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    cli = Path(fake_home["cli_root"])
+    original = cli / "skills"
+    original.rename(cli / "skills-original")
+    outside = tmp_path / "outside-skills"
+    outside.mkdir()
+    (outside / "hidden").mkdir()
+    (outside / "hidden" / "SKILL.md").write_text("---\nname: hidden\ndescription: Hidden.\n---\n\nBody.\n")
+    original.symlink_to(outside, target_is_directory=True)
+    tool = {item.name: item for item in build_import_tools(fake_home)}["claude_import_scan"]
+
+    out = tool.invoke({})
+
+    assert "skills [user]" in out
+    assert "REFUSED" in out
+    assert "outside declared root" in out
+    assert "hidden" not in out
+
+
+async def test_skill_import_reports_symlinked_user_skills_root(fake_home, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    cli = Path(fake_home["cli_root"])
+    original = cli / "skills"
+    original.rename(cli / "skills-original")
+    outside = tmp_path / "outside-skills"
+    outside.mkdir()
+    original.symlink_to(outside, target_is_directory=True)
+    tool = {item.name: item for item in build_import_tools(fake_home)}["claude_import_skills"]
+
+    out = await tool.ainvoke({"source": "user"})
+
+    assert "REFUSED" in out
+    assert "outside declared root" in out
+
+
 async def test_skill_import_honors_configured_read_cap(fake_home, fake_host, tmp_path):
     from claude_bridge.tools_import import build_import_tools
 
@@ -322,6 +360,24 @@ async def test_mcp_reports_hide_stdio_argument_values_without_changing_applied_c
     assert marker not in applied
     assert "args=3" in dry
     assert configured["args"] == full_args
+
+
+async def test_mcp_import_reports_oversized_settings(fake_home):
+    from claude_bridge.tools_import import build_import_tools
+
+    settings = Path(fake_home["cli_root"]) / "settings.json"
+    settings.write_text(settings.read_text() + " " * 129)
+    capped = dict(fake_home, max_read_bytes=128)
+    tools = {item.name: item for item in build_import_tools(capped)}
+
+    imported = await tools["claude_import_mcp"].ainvoke({})
+    scanned = tools["claude_import_scan"].invoke({})
+    hooks = tools["claude_hooks_report"].invoke({})
+
+    expected = "settings.json exceeds max_read_bytes=128"
+    assert expected in imported
+    assert expected in scanned
+    assert expected in hooks
 
 
 async def test_memory_import_continues_after_oversized_topic(fake_home, fake_host, tmp_path):

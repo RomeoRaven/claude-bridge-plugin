@@ -38,10 +38,14 @@ def _safe_resolved_paths(fence: FencedRoot, paths, *, directories: bool) -> list
     return safe
 
 
-def _safe_markdown_files(fence: FencedRoot, rel_dir: str) -> list[Path]:
+def _safe_markdown_files(
+    fence: FencedRoot, rel_dir: str, problems: list[str] | None = None, *, label: str = ""
+) -> list[Path]:
     try:
         root = fence.resolve(rel_dir)
     except (OSError, ValueError):
+        if problems is not None:
+            problems.append(f"{label or rel_dir}: REFUSED (unreadable or outside declared root)")
         return []
     if not root.is_dir():
         return []
@@ -65,8 +69,8 @@ def _cowork_manifest_types(stores: ClaudeStores) -> tuple[dict[str, str], set[Pa
     return out, unverifiable
 
 
-def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, str]], list[str]]:
-    """(importable (skill_dir, provenance_label) candidates, excluded names).
+def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, str]], list[str], list[str]]:
+    """Return importable candidates, license exclusions, and source problems.
 
     Exclusions are license-driven and non-negotiable: Cowork's manifest marks
     Anthropic-authored skills (`creatorType: anthropic`) — those never enter
@@ -76,12 +80,12 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
         try:
             root = stores.cli.resolve("skills")
         except (OSError, ValueError):
-            return [], []
+            return [], [], ["user skills root: REFUSED (unreadable or outside declared root)"]
         if not root.is_dir():
-            return [], []
+            return [], [], []
         return [
             (p, "claude-code:user") for p in _safe_resolved_paths(stores.cli, sorted(root.iterdir()), directories=True)
-        ], []
+        ], [], []
     if source == "cowork":
         types, unverifiable = _cowork_manifest_types(stores)
         candidates, excluded = [], []
@@ -95,18 +99,18 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
                 excluded.append(p.name)
             else:
                 candidates.append((p, "claude-cowork"))
-        return candidates, excluded
+        return candidates, excluded, []
     # anything else is a project directory
     project = FencedRoot("project", Path(source).expanduser())
     try:
         root = project.resolve(".claude/skills")
     except (OSError, ValueError):
-        return [], []
+        return [], [], [f"project skills root: REFUSED (unreadable or outside declared root): {source}"]
     if not root.is_dir():
-        return [], []
+        return [], [], []
     return [
         (p, f"claude-code:{source}") for p in _safe_resolved_paths(project, sorted(root.iterdir()), directories=True)
-    ], []
+    ], [], []
 
 
 def _pick(names: str, available: list[str]) -> list[str]:
@@ -130,9 +134,9 @@ def build_import_tools(cfg: dict) -> list:
         try:
             lines: list[str] = []
             for source in ["user", "cowork"] + ([project_dir] if project_dir else []):
-                candidates, excluded = _skill_sources(stores, source)
+                candidates, excluded, source_problems = _skill_sources(stores, source)
                 names = []
-                refused = []
+                refused = list(source_problems)
                 for d, _ in candidates:
                     try:
                         skill_fence = FencedRoot("skill", d)
@@ -152,18 +156,39 @@ def build_import_tools(cfg: dict) -> list:
                         )
                     if refused:
                         lines.append(f"  refused: {', '.join(refused)}")
-            cmds = [p.stem for p in _safe_markdown_files(stores.cli, "commands")]
+            markdown_problems: list[str] = []
+            cmds = [
+                p.stem
+                for p in _safe_markdown_files(
+                    stores.cli, "commands", markdown_problems, label="user commands root"
+                )
+            ]
             project_fence = FencedRoot("project", Path(project_dir).expanduser()) if project_dir else None
             if project_fence is not None:
-                cmds += [p.stem for p in _safe_markdown_files(project_fence, ".claude/commands")]
+                cmds += [
+                    p.stem
+                    for p in _safe_markdown_files(
+                        project_fence, ".claude/commands", markdown_problems, label="project commands root"
+                    )
+                ]
             if cmds:
                 lines.append(f"commands: {', '.join(cmds)}")
-            agents = [p.stem for p in _safe_markdown_files(stores.cli, "agents")]
+            agents = [
+                p.stem
+                for p in _safe_markdown_files(stores.cli, "agents", markdown_problems, label="user agents root")
+            ]
             if project_fence is not None:
-                agents += [p.stem for p in _safe_markdown_files(project_fence, ".claude/agents")]
+                agents += [
+                    p.stem
+                    for p in _safe_markdown_files(
+                        project_fence, ".claude/agents", markdown_problems, label="project agents root"
+                    )
+                ]
             if agents:
                 lines.append(f"subagents: {', '.join(agents)}")
+            lines += [f"refused: {problem}" for problem in markdown_problems]
             mcp_names: list[str] = []
+            mcp_problems: list[str] = []
             settings = stores.cli.root / "settings.json"
             if settings.is_file():
                 try:
@@ -172,8 +197,8 @@ def build_import_tools(cfg: dict) -> list:
                             _bounded_json(stores.cli, "settings.json", stores.max_read_bytes).get("mcpServers") or {}
                         ).keys()
                     )
-                except ValueError:
-                    pass
+                except ValueError as exc:
+                    mcp_problems.append(f"settings.json: REFUSED ({exc})")
             if project_fence is not None:
                 if (project_fence.root / ".mcp.json").is_file():
                     try:
@@ -182,10 +207,11 @@ def build_import_tools(cfg: dict) -> list:
                                 _bounded_json(project_fence, ".mcp.json", stores.max_read_bytes).get("mcpServers") or {}
                             ).keys()
                         )
-                    except ValueError:
-                        pass
+                    except ValueError as exc:
+                        mcp_problems.append(f"project .mcp.json: REFUSED ({exc})")
             if mcp_names:
                 lines.append(f"mcp servers: {', '.join(mcp_names)}")
+            lines += [f"mcp: {problem}" for problem in mcp_problems]
             if project_dir:
                 found = stores.find_project(project_dir)
                 if found:
@@ -211,9 +237,9 @@ def build_import_tools(cfg: dict) -> list:
         redistribution); existing skills are never overwritten.
         """
         try:
-            candidates, excluded = _skill_sources(stores, source)
+            candidates, excluded, source_problems = _skill_sources(stores, source)
             chosen = _pick(names, [d.name for d, _ in candidates])
-            results: list[str] = []
+            results: list[str] = list(source_problems)
             target = importer.skills_target_root() if apply else None
             for d, label in candidates:
                 if d.name not in chosen:
@@ -248,12 +274,14 @@ def build_import_tools(cfg: dict) -> list:
         'all'. Dry-run by default; existing skills are never overwritten.
         """
         try:
-            files = _safe_markdown_files(stores.cli, "commands")
+            results: list[str] = []
+            files = _safe_markdown_files(stores.cli, "commands", results, label="user commands root")
             if project_dir:
                 project_fence = FencedRoot("project", Path(project_dir).expanduser())
-                files += _safe_markdown_files(project_fence, ".claude/commands")
+                files += _safe_markdown_files(
+                    project_fence, ".claude/commands", results, label="project commands root"
+                )
             chosen = _pick(names, [p.stem for p in files])
-            results: list[str] = []
             target = importer.skills_target_root() if apply else None
             for p in files:
                 if p.stem not in chosen:
@@ -285,13 +313,13 @@ def build_import_tools(cfg: dict) -> list:
         model). Dry-run by default.
         """
         try:
-            files = _safe_markdown_files(stores.cli, "agents")
+            results: list[str] = []
+            files = _safe_markdown_files(stores.cli, "agents", results, label="user agents root")
             if project_dir:
                 project_fence = FencedRoot("project", Path(project_dir).expanduser())
-                files += _safe_markdown_files(project_fence, ".claude/agents")
+                files += _safe_markdown_files(project_fence, ".claude/agents", results, label="project agents root")
             chosen = _pick(names, [p.stem for p in files])
             subs = []
-            results: list[str] = []
             for p in files:
                 if p.stem not in chosen:
                     continue
@@ -324,12 +352,13 @@ def build_import_tools(cfg: dict) -> list:
         """
         try:
             cc: dict = {}
+            source_problems: list[str] = []
             settings = stores.cli.root / "settings.json"
             if settings.is_file():
                 try:
                     cc.update(_bounded_json(stores.cli, "settings.json", stores.max_read_bytes).get("mcpServers") or {})
-                except ValueError:
-                    pass
+                except ValueError as exc:
+                    source_problems.append(f"settings.json: REFUSED ({exc})")
             if project_dir:
                 project_fence = FencedRoot("project", Path(project_dir).expanduser())
                 mcp_json = Path(project_dir).expanduser() / ".mcp.json"
@@ -338,13 +367,13 @@ def build_import_tools(cfg: dict) -> list:
                         cc.update(
                             _bounded_json(project_fence, ".mcp.json", stores.max_read_bytes).get("mcpServers") or {}
                         )
-                    except ValueError:
-                        pass
+                    except ValueError as exc:
+                        source_problems.append(f"project .mcp.json: REFUSED ({exc})")
             chosen = _pick(names, sorted(cc.keys()))
             entries, warnings = tr.translate_mcp_servers({k: v for k, v in cc.items() if k in chosen})
             if not entries and not warnings:
-                return "no matching MCP servers found"
-            results = []
+                return "\n".join(source_problems) if source_problems else "no matching MCP servers found"
+            results = list(source_problems)
             for e in entries:
                 safe = {k: v for k, v in e.items() if k not in ("env", "headers", "args")}
                 if safe.get("url"):
@@ -455,6 +484,7 @@ def build_import_tools(cfg: dict) -> list:
         """
         try:
             sections: list[str] = []
+            source_problems: list[str] = []
             sources: list[tuple[str, FencedRoot, str]] = [("user", stores.cli, "settings.json")]
             if project_dir:
                 sources.append(
@@ -469,15 +499,16 @@ def build_import_tools(cfg: dict) -> list:
                     continue
                 try:
                     hooks = _bounded_json(fence, rel, stores.max_read_bytes).get("hooks") or {}
-                except ValueError:
+                except ValueError as exc:
+                    source_problems.append(f"{label} {rel}: REFUSED ({exc})")
                     continue
                 if hooks:
                     sections.append(f"[{label}] {json.dumps(hooks, indent=1)[:1500]}")
             if not sections:
-                return "no hooks configured"
+                return "\n".join(source_problems) if source_problems else "no hooks configured"
             return (
                 "Hooks found (NOT translated — protoAgent's equivalent is plugin middleware, "
-                "ADR 0032; port these deliberately):\n" + "\n".join(sections)
+                "ADR 0032; port these deliberately):\n" + "\n".join(sections + source_problems)
             )
         except Exception as exc:  # noqa: BLE001
             return f"error: {exc}"

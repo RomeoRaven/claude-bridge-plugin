@@ -63,7 +63,8 @@ def build_export_tools(cfg: dict) -> list:
 
         translated_skills = []
         warnings: list[str] = []
-        candidates, _excluded = _skill_sources(stores, "user")
+        candidates, _excluded, skill_source_problems = _skill_sources(stores, "user")
+        warnings.extend(skill_source_problems)
         by_name = {p.name: (p, label) for p, label in candidates}
         for picked in _pick(skills, sorted(by_name)):
             src, label = by_name[picked]
@@ -75,10 +76,23 @@ def build_export_tools(cfg: dict) -> list:
             if got is not None:
                 translated_skills.append(got)
 
-        subagents = []
-        agent_files = _safe_markdown_files(stores.cli, "agents")
+        command_files = _safe_markdown_files(stores.cli, "commands", warnings, label="user commands root")
         if project_fence is not None:
-            agent_files += _safe_markdown_files(project_fence, ".claude/agents")
+            command_files += _safe_markdown_files(
+                project_fence, ".claude/commands", warnings, label="project commands root"
+            )
+        for md in command_files:
+            try:
+                translated_skills.append(tr.translate_command_md(md, max_bytes=stores.max_read_bytes))
+            except ValueError as exc:
+                warnings.append(f"command {md.stem}: {exc} (skipped)")
+
+        subagents = []
+        agent_files = _safe_markdown_files(stores.cli, "agents", warnings, label="user agents root")
+        if project_fence is not None:
+            agent_files += _safe_markdown_files(
+                project_fence, ".claude/agents", warnings, label="project agents root"
+            )
         for md in agent_files:
             try:
                 subagents.append(tr.translate_subagent_md(md, stores.max_read_bytes))
