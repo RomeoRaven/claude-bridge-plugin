@@ -25,12 +25,22 @@ def _bounded_json(fence: FencedRoot, rel: str, max_bytes: int) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _safe_resolved_paths(fence: FencedRoot, paths, *, directories: bool) -> list[Path]:
+def _safe_resolved_paths(
+    fence: FencedRoot, paths, *, directories: bool, problems: list[str] | None = None, label: str = ""
+) -> list[Path]:
+    """Resolve each entry inside the fence; name the ones that escape it.
+
+    A symlinked skill/command/agent that points outside the store (a common
+    dotfiles setup) is refused, never followed — but silently dropping it
+    leaves the operator guessing why their skill is missing, so the refusal is
+    reported through ``problems`` when the caller collects them."""
     safe: list[Path] = []
     for path in paths:
         try:
             candidate = fence.resolve(str(path.relative_to(fence.root)))
         except (OSError, ValueError):
+            if problems is not None:
+                problems.append(f"{label or fence.name}: {path.name}: REFUSED (outside declared root)")
             continue
         matches_kind = candidate.is_dir() if directories else candidate.is_file()
         if matches_kind:
@@ -49,7 +59,7 @@ def _safe_markdown_files(
         return []
     if not root.is_dir():
         return []
-    return _safe_resolved_paths(fence, sorted(root.glob("*.md")), directories=False)
+    return _safe_resolved_paths(fence, sorted(root.glob("*.md")), directories=False, problems=problems, label=label)
 
 
 def _cowork_manifest_types(stores: ClaudeStores) -> tuple[dict[str, str], set[Path]]:
@@ -83,14 +93,21 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
             return [], [], ["user skills root: REFUSED (unreadable or outside declared root)"]
         if not root.is_dir():
             return [], [], []
-        return [
-            (p, "claude-code:user") for p in _safe_resolved_paths(stores.cli, sorted(root.iterdir()), directories=True)
-        ], [], []
+        problems: list[str] = []
+        safe = _safe_resolved_paths(
+            stores.cli, sorted(root.iterdir()), directories=True, problems=problems, label="user skills"
+        )
+        return [(p, "claude-code:user") for p in safe], [], problems
     if source == "cowork":
         types, unverifiable = _cowork_manifest_types(stores)
         candidates, excluded = [], []
+        problems: list[str] = []
         paths = _safe_resolved_paths(
-            stores.cowork, sorted(stores.cowork.root.glob("skills-plugin/*/*/skills/*")), directories=True
+            stores.cowork,
+            sorted(stores.cowork.root.glob("skills-plugin/*/*/skills/*")),
+            directories=True,
+            problems=problems,
+            label="cowork skills",
         )
         for p in paths:
             if p.parent.parent.resolve() in unverifiable:
@@ -99,7 +116,7 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
                 excluded.append(p.name)
             else:
                 candidates.append((p, "claude-cowork"))
-        return candidates, excluded, []
+        return candidates, excluded, problems
     # anything else is a project directory
     project = FencedRoot("project", Path(source).expanduser())
     try:
@@ -108,9 +125,11 @@ def _skill_sources(stores: ClaudeStores, source: str) -> tuple[list[tuple[Path, 
         return [], [], [f"project skills root: REFUSED (unreadable or outside declared root): {source}"]
     if not root.is_dir():
         return [], [], []
-    return [
-        (p, f"claude-code:{source}") for p in _safe_resolved_paths(project, sorted(root.iterdir()), directories=True)
-    ], [], []
+    problems: list[str] = []
+    safe = _safe_resolved_paths(
+        project, sorted(root.iterdir()), directories=True, problems=problems, label="project skills"
+    )
+    return [(p, f"claude-code:{source}") for p in safe], [], problems
 
 
 def _pick(names: str, available: list[str]) -> list[str]:
@@ -159,9 +178,7 @@ def build_import_tools(cfg: dict) -> list:
             markdown_problems: list[str] = []
             cmds = [
                 p.stem
-                for p in _safe_markdown_files(
-                    stores.cli, "commands", markdown_problems, label="user commands root"
-                )
+                for p in _safe_markdown_files(stores.cli, "commands", markdown_problems, label="user commands root")
             ]
             project_fence = FencedRoot("project", Path(project_dir).expanduser()) if project_dir else None
             if project_fence is not None:
@@ -174,8 +191,7 @@ def build_import_tools(cfg: dict) -> list:
             if cmds:
                 lines.append(f"commands: {', '.join(cmds)}")
             agents = [
-                p.stem
-                for p in _safe_markdown_files(stores.cli, "agents", markdown_problems, label="user agents root")
+                p.stem for p in _safe_markdown_files(stores.cli, "agents", markdown_problems, label="user agents root")
             ]
             if project_fence is not None:
                 agents += [
@@ -278,9 +294,7 @@ def build_import_tools(cfg: dict) -> list:
             files = _safe_markdown_files(stores.cli, "commands", results, label="user commands root")
             if project_dir:
                 project_fence = FencedRoot("project", Path(project_dir).expanduser())
-                files += _safe_markdown_files(
-                    project_fence, ".claude/commands", results, label="project commands root"
-                )
+                files += _safe_markdown_files(project_fence, ".claude/commands", results, label="project commands root")
             chosen = _pick(names, [p.stem for p in files])
             target = importer.skills_target_root() if apply else None
             for p in files:

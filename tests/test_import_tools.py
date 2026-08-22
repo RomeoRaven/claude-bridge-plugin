@@ -155,6 +155,44 @@ async def test_skill_import_refuses_symlinked_source_escape(fake_home, fake_host
     assert not (fake_host["skills_root"] / "outside").exists()
 
 
+async def test_symlinked_skill_entry_is_refused_visibly_not_silently(fake_home, fake_host, tmp_path):
+    """A skill dir symlinked out of ~/.claude (common dotfiles setup) is refused — but
+    NAMED in scan and import output, so the operator learns why it is missing."""
+    from claude_bridge.tools_import import build_import_tools
+
+    marker = secrets.token_urlsafe(24)
+    outside = tmp_path / "outside-skill"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text(f"---\nname: outside\ndescription: {marker}\n---\n\nOutside.\n")
+    skills = tmp_path / "dot-claude" / "skills"
+    (skills / "linked-away").symlink_to(outside, target_is_directory=True)
+    tools = {item.name: item for item in build_import_tools(fake_home)}
+
+    scan = tools["claude_import_scan"].invoke({})
+    assert "linked-away: REFUSED" in scan
+    assert marker not in scan
+
+    imported = await tools["claude_import_skills"].ainvoke({"names": "all", "source": "user"})
+    assert "linked-away: REFUSED" in imported
+    assert marker not in imported
+    assert "demo-skill" in imported  # the healthy sibling still imports
+
+
+def test_symlinked_command_entry_is_refused_visibly(fake_home, tmp_path):
+    from claude_bridge.tools_import import build_import_tools
+
+    outside = tmp_path / "outside-cmd.md"
+    outside.write_text("---\ndescription: Outside.\n---\n\nBody.\n")
+    commands = Path(fake_home["cli_root"]) / "commands"
+    commands.mkdir(exist_ok=True)
+    (commands / "linked-cmd.md").symlink_to(outside)
+    tool = {item.name: item for item in build_import_tools(fake_home)}["claude_import_scan"]
+
+    out = tool.invoke({})
+
+    assert "linked-cmd.md: REFUSED" in out
+
+
 def test_scan_reports_symlinked_user_skills_root(fake_home, tmp_path):
     from claude_bridge.tools_import import build_import_tools
 
