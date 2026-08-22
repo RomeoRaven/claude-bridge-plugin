@@ -90,9 +90,7 @@ def build_export_tools(cfg: dict) -> list:
         subagents = []
         agent_files = _safe_markdown_files(stores.cli, "agents", warnings, label="user agents root")
         if project_fence is not None:
-            agent_files += _safe_markdown_files(
-                project_fence, ".claude/agents", warnings, label="project agents root"
-            )
+            agent_files += _safe_markdown_files(project_fence, ".claude/agents", warnings, label="project agents root")
         for md in agent_files:
             try:
                 subagents.append(tr.translate_subagent_md(md, stores.max_read_bytes))
